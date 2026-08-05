@@ -1,0 +1,1 @@
+"""Streamlit ingest page stub."""

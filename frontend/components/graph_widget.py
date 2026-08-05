@@ -1,0 +1,1 @@
+"""Kinetic graph widget stub."""
