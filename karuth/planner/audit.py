@@ -1,0 +1,133 @@
+"""Ledger-backed audit trail for planner decisions.
+
+Every meaningful planner transition is appended to the hash-chained ledger so
+the whole investigation is auditable and replayable. Entry types follow the
+existing schema: ``agent_action`` for planner steps, ``review_action`` for
+reveal/authorization decisions, ``export`` for report/export actions, and
+``evidence`` for ingestion events the planner triggers.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from karuth.ledger import LedgerEntry, LedgerEntryCreate, LedgerStore
+from karuth.planner.schema import InvestigationPlan
+
+
+class PlannerAuditor:
+    def __init__(self, ledger: LedgerStore, case_id: str, actor: str = "planner") -> None:
+        self._ledger = ledger
+        self._case_id = case_id
+        self._actor = actor
+
+    def _append(
+        self,
+        entry_type: str,
+        action: str,
+        target: str,
+        payload: dict[str, Any],
+    ) -> LedgerEntry:
+        return self._ledger.append(
+            LedgerEntryCreate(
+                entry_type=entry_type,
+                case_id=self._case_id,
+                actor=self._actor,
+                action=action,
+                target=target,
+                payload=payload,
+            )
+        )
+
+    # ---- agent_action -----------------------------------------------------
+    def goal_received(self, goal: str) -> LedgerEntry:
+        return self._append("agent_action", "goal_received", "goal", {"goal": goal})
+
+    def plan_generated(self, plan: InvestigationPlan, *, replan: bool = False) -> LedgerEntry:
+        return self._append(
+            "agent_action",
+            "replan_generated" if replan else "plan_generated",
+            "plan",
+            {
+                "tool_list": [task.tool for task in plan.tasks],
+                "rationale": {task.tool: task.reason for task in plan.tasks},
+                "risk_level": plan.safety_policy.risk_level,
+                "plan": plan.model_dump(mode="json"),
+            },
+        )
+
+    def task_selected(self, tool: str, reason: str) -> LedgerEntry:
+        return self._append(
+            "agent_action", "task_selected", "task", {"tool": tool, "reason": reason}
+        )
+
+    def task_dispatched(self, tool: str, inputs: list[str]) -> LedgerEntry:
+        return self._append(
+            "agent_action", "task_dispatched", "task", {"tool": tool, "inputs": inputs}
+        )
+
+    def task_completed(self, tool: str, summary: str) -> LedgerEntry:
+        return self._append(
+            "agent_action", "task_completed", "task", {"tool": tool, "summary": summary}
+        )
+
+    def task_failed(self, tool: str, error: str) -> LedgerEntry:
+        return self._append(
+            "agent_action", "task_failed", "task", {"tool": tool, "error": error}
+        )
+
+    def postcondition(self, name: str, ok: bool) -> LedgerEntry:
+        return self._append(
+            "agent_action", "postcondition_checked", "postcondition", {"name": name, "ok": ok}
+        )
+
+    def replan_triggered(self, reason: str) -> LedgerEntry:
+        return self._append(
+            "agent_action", "replan_triggered", "plan", {"reason": reason}
+        )
+
+    def chain_verified(self, ok: bool) -> LedgerEntry:
+        return self._append(
+            "agent_action", "chain_verified", "ledger", {"ok": ok}
+        )
+
+    def planner_finished(self, summary: dict[str, Any]) -> LedgerEntry:
+        return self._append(
+            "agent_action", "planner_finished", "plan", summary
+        )
+
+    # ---- evidence ---------------------------------------------------------
+    def evidence_ingested(self, entity_count: int) -> LedgerEntry:
+        return self._append(
+            "evidence", "evidence_ingested", "case_evidence", {"entity_count": entity_count}
+        )
+
+    # ---- review_action ----------------------------------------------------
+    def review_request(self, target: str, tier: str, dual_required: bool) -> LedgerEntry:
+        return self._append(
+            "review_action",
+            "reveal_requested",
+            target,
+            {"tier": tier, "dual_authorization_required": dual_required},
+        )
+
+    def critical_gated(self, target: str) -> LedgerEntry:
+        return self._append("review_action", "critical_content_gated", target, {"gated": True})
+
+    def review_decision(self, target: str, decision: str, note: str = "") -> LedgerEntry:
+        return self._append(
+            "review_action",
+            "review_decision",
+            target,
+            {"decision": decision, "note": note},
+        )
+
+    # ---- export -----------------------------------------------------------
+    def export(self, kind: str, target: str, summary: dict[str, Any]) -> LedgerEntry:
+        return self._append(
+            "export", f"{kind}_exported", target, summary
+        )
+
+    # ---- integrity --------------------------------------------------------
+    def verify(self) -> bool:
+        return self._ledger.verify()
