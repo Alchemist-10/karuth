@@ -19,10 +19,6 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
-llm = [
-    "langchain-core>=0.3",
-    "langchain-ollama>=0.1",
-]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
