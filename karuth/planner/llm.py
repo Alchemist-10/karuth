@@ -1,35 +1,43 @@
-"""Replaceable LLM planning backend.
+"""Replaceable planning backends for the agentic planner.
 
-The planner uses the backend only for goal interpretation, task selection, and
-replanning. Evidence extraction and correlation stay deterministic. The default
-backend is offline-safe (keyword based); an optional Ollama backend can be
-swapped in when `langchain-ollama` is installed.
+The planner uses a backend only for goal interpretation, task selection, and
+replanning. Evidence extraction, correlation, triage, reporting, and legal
+rendering stay deterministic — the LLM is never allowed to invent evidence,
+modify extracted entities, perform matching, or bypass guardrails.
+
+Backends
+--------
+- ``LMStudioPlanner``: the default. Talks to a local LM Studio server at an
+  OpenAI-compatible REST endpoint (``http://localhost:1234/v1``) via the
+  OpenAI Python SDK. LM Studio manages model execution; the planner never
+  loads GGUF weights or uses transformers directly.
+- ``DeterministicPlanner``: offline, explainable, keyword-based fallback,
+  always available.
+- ``FallbackPlanner``: wraps an LLM backend and falls back to
+  ``DeterministicPlanner`` on any failure (timeout, invalid JSON, unavailable
+  model, network error), so the agentic default never dead-ends.
+
+New providers subclass ``_BaseChatPlanner``, implement ``_complete``, and are
+registered in :func:`build_planner`.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Protocol
 
-from karuth.config import REASONING_MODEL
-from karuth.planner.schema import InvestigationPlan, PlannerTask, SafetyPolicy
-
-EVIDENCE_KEYWORDS = (
-    "video",
-    "chat",
-    "image",
-    "photo",
-    "phone",
-    "transaction",
-    "bank",
-    "face",
-    "document",
-    "account",
-    "message",
-    "contact",
-    "gps",
-    "location",
+from karuth.config import (
+    LMSTUDIO_BASE_URL,
+    LMSTUDIO_MAX_TOKENS,
+    LMSTUDIO_MODEL,
+    LMSTUDIO_TEMPERATURE,
+    LMSTUDIO_TIMEOUT,
 )
+from karuth.planner.evidence import EvidenceItem, evidence_summary
+from karuth.planner.schema import InvestigationPlan, PlannerTask, SafetyPolicy
+from karuth.planner.tools import TOOL_REGISTRY, tool_metadata_text
+
 CORRELATE_KEYWORDS = (
     "correlat",
     "cross-reference",
@@ -107,18 +115,18 @@ SENSITIVE_KEYWORDS = (
 )
 CRITICAL_KEYWORDS = ("critical", "credential", "password", "dual", "extreme")
 
-TOOL_REASONS: dict[str, str] = {
-    "ExtractionAgent": "goal depends on case evidence; extraction must run first",
-    "CorrelationAgent": "goal mentions linking/relationships; deterministic correlation may find matches",
-    "TimelineAgent": "goal asks about sequence or timing; ordering entities chronologically",
-    "TriageAgent": "goal asks for priority or top leads; rank matches by score and relevance",
-    "ReportAgent": "produce an investigator-ready case summary",
-    "LegalActionAgent": "goal requests a legal document; fill the requested template",
-}
+
+def _hit(text: str, keywords: tuple[str, ...]) -> bool:
+    return any(keyword in text for keyword in keywords)
 
 
 class PlannerLLM(Protocol):
-    """Contract for any planner backend (deterministic or LLM)."""
+    """Contract for any planner backend (deterministic or LLM).
+
+    Backends may additionally expose ``backend_name`` (str) and
+    ``is_available()`` (bool) as optional attributes; the planner reads them
+    defensively with ``getattr`` so existing custom backends keep working.
+    """
 
     def generate_plan(self, goal: str, state_summary: dict[str, Any]) -> InvestigationPlan:
         """Produce a structured plan for a goal."""
@@ -132,10 +140,6 @@ class PlannerLLM(Protocol):
         """Produce a revised plan when the first pass is insufficient."""
 
 
-def _hit(text: str, keywords: tuple[str, ...]) -> bool:
-    return any(keyword in text for keyword in keywords)
-
-
 def _legal_inputs(goal: str) -> tuple[str, list[str], dict[str, Any]]:
     if "notice" in goal or "section 94" in goal:
         return "section_94_bnss_notice", ["section_94_bnss_notice"], {
@@ -146,6 +150,14 @@ def _legal_inputs(goal: str) -> tuple[str, list[str], dict[str, Any]]:
         "source_description": "Synthetic evidence bundle",
         "evidence_hash": "PENDING",
     }
+
+
+def _reason_for(tool: str) -> str:
+    """Audit-safe one-line reason for scheduling a tool, from its metadata."""
+    spec = TOOL_REGISTRY.get(tool)
+    if spec is None:
+        return f"goal requires {tool}"
+    return spec.description.split(".")[0].strip() + "."
 
 
 def _build_plan(
@@ -174,25 +186,17 @@ def _build_plan(
             PlannerTask(
                 step=step,
                 tool=tool,
-                reason=TOOL_REASONS[tool],
+                reason=_reason_for(tool),
                 inputs=inputs,
                 fields=fields,
             )
         )
 
     expected_output = ["investigation_plan_json", "ledger_audit_entries"]
-    if "ExtractionAgent" in ordered:
-        expected_output.append("extracted_entities")
-    if "CorrelationAgent" in ordered:
-        expected_output.append("correlation_matches")
-    if "TimelineAgent" in ordered:
-        expected_output.append("chronological_timeline")
-    if "TriageAgent" in ordered:
-        expected_output.append("ranked_leads")
-    if "ReportAgent" in ordered:
-        expected_output.append("case_summary")
-    if "LegalActionAgent" in ordered:
-        expected_output.append("rendered_legal_document")
+    for tool in ordered:
+        spec = TOOL_REGISTRY.get(tool)
+        if spec is not None:
+            expected_output.extend(output.label for output in spec.produced_outputs)
 
     needs_human_review = risk_level in ("MED", "CRITICAL")
     return InvestigationPlan(
@@ -212,15 +216,22 @@ def _build_plan(
             "correlation returns no matches",
             "plan exhausted without sufficient evidence",
         ],
+        reasoning_summary=(
+            f"Selected {len(ordered)} deterministic tools ({', '.join(ordered)}) to satisfy "
+            f"the goal; confidence {confidence:.2f}."
+        ),
     )
 
 
 class DeterministicPlanner:
     """Offline, explainable, keyword-based planner.
 
-    Default backend. Keeps the system fully air-gapped while still producing
-    goal-dependent plans. Swappable for an LLM backend through `PlannerLLM`.
+    Fallback backend: always available, keeps the system fully air-gapped
+    while still producing goal-dependent plans. Used automatically whenever
+    an LLM backend fails, or on demand via ``build_planner("deterministic")``.
     """
+
+    backend_name = "deterministic"
 
     def generate_plan(self, goal: str, state_summary: dict[str, Any] | None = None) -> InvestigationPlan:
         state_summary = state_summary or {}
@@ -288,6 +299,8 @@ class DeterministicPlanner:
         tools = list(current)
 
         if state_summary.get("match_count", 0) == 0:
+            if "ExtractionAgent" not in tools:
+                tools.insert(0, "ExtractionAgent")
             if "TimelineAgent" not in tools:
                 tools.append("TimelineAgent")
             if "CorrelationAgent" not in tools:
@@ -315,52 +328,175 @@ class DeterministicPlanner:
             confidence=0.7,
         )
 
-
-_SYSTEM_PROMPT = (
-    "You are the planning backend for Karuth, an offline, case-scoped "
-    "investigation intelligence system. Interpret the investigator goal and "
-    "select the minimal ordered tool list from: ExtractionAgent, "
-    "CorrelationAgent, TimelineAgent, TriageAgent, ReportAgent, "
-    "LegalActionAgent. Never invent evidence, never propose external URLs or "
-    "network calls, never fabricate matches. Only produce the JSON plan.\n"
-    "Safety policy: LOW is normal; MED requires blur_by_default true; CRITICAL "
-    "requires dual_authorization_required true. Set needs_human_review true for "
-    "MED or CRITICAL."
-)
+    def is_available(self) -> bool:
+        return True
 
 
-class OllamaPlanner:
-    """Ollama-backed planner backend (requires ``langchain-ollama``).
+# ---------------------------------------------------------------------------
+# Semantic (LLM) planning backends
+# ---------------------------------------------------------------------------
 
-    Lazily imports the integration so the package stays importable offline.
+_SYSTEM_PROMPT_TEMPLATE = """\
+You are the planning backend for Karuth, an offline, case-scoped investigation \
+intelligence system. You interpret the investigator's goal and return a STRICT \
+JSON InvestigationPlan. You NEVER invent evidence, NEVER modify extracted \
+entities, NEVER perform matching yourself, NEVER fabricate results, NEVER \
+bypass guardrails or review authorization, and NEVER propose external URLs or \
+network calls. You ONLY decide which deterministic tools to run, in what \
+order, and when to stop.
+
+AVAILABLE DETERMINISTIC TOOLS (all run locally; you only schedule them):
+{tool_metadata}
+
+EVIDENCE INVENTORY OF THE CASE FOLDER:
+{evidence}
+
+RULES:
+- Schedule tools that can actually produce useful output for THIS case and \
+THIS goal. Do not schedule a tool whose required state inputs cannot be \
+produced, and do not schedule ExtractionAgent when the case folder holds no \
+supported evidence files (chats/images).
+- ExtractionAgent must precede CorrelationAgent, TimelineAgent, and \
+TriageAgent. CorrelationAgent must precede TriageAgent and ReportAgent.
+- Outputs from CorrelationAgent, TimelineAgent, TriageAgent, and ReportAgent \
+may contain PII and require human review; set needs_human_review true for MED \
+or CRITICAL risk.
+- Safety policy: LOW is normal; MED requires blur_by_default true; CRITICAL \
+requires dual_authorization_required true and needs_human_review true.
+- If the goal is a legal document request, schedule LegalActionAgent with the \
+correct template input ("section_94_bnss_notice" for notices / section 94, \
+otherwise "section_63_bsa_certificate") plus ReportAgent. No evidence tools.
+- Keep the tool list minimal and ordered. Never schedule a tool twice.
+
+Return ONLY a JSON object matching this schema (no prose, no markdown fences):
+{{
+  "goal": "<the investigator goal verbatim>",
+  "case_scope": "inside_case_folder_only",
+  "confidence": <0.0 to 1.0>,
+  "needs_human_review": <bool>,
+  "safety_policy": {{
+    "risk_level": "LOW" | "MED" | "CRITICAL",
+    "blur_by_default": <bool>,
+    "dual_authorization_required": <bool>
+  }},
+  "tasks": [
+    {{
+      "step": <int starting at 1>,
+      "tool": "ExtractionAgent" | "CorrelationAgent" | "TimelineAgent" | \
+"TriageAgent" | "ReportAgent" | "LegalActionAgent",
+      "reason": "<audit-safe one-line reason>",
+      "inputs": [],
+      "fields": {{}}
+    }}
+  ],
+  "expected_output": ["<labels of outputs each task produces>"],
+  "stop_conditions": ["<conditions under which the investigation can stop>"],
+  "reasoning_summary": "<concise, audit-safe explanation of the plan; never chain-of-thought>"
+}}"""
+
+
+def _build_messages(
+    goal: str,
+    state_summary: dict[str, Any],
+    *,
+    replan: bool,
+    previous_plan: InvestigationPlan | None = None,
+) -> list[dict[str, str]]:
+    evidence = state_summary.get("available_evidence") or []
+    evidence_text = _evidence_text(evidence)
+    system = _SYSTEM_PROMPT_TEMPLATE.format(
+        tool_metadata=tool_metadata_text(),
+        evidence=evidence_text,
+    )
+    serializable = json.dumps(_json_safe(state_summary), sort_keys=True, default=str)
+    user = f"Investigator goal: {goal}\n\nCurrent case state summary:\n{serializable}\n\n"
+    if replan:
+        previous = (
+            json.dumps(previous_plan.model_dump(mode="json"), sort_keys=True, default=str)
+            if previous_plan is not None
+            else "none"
+        )
+        user += (
+            "Previous plan (JSON):\n" + previous + "\n\n"
+            "The previous plan was insufficient. Return a REVISED minimal "
+            "InvestigationPlan JSON that fixes the problem, still respecting "
+            "the rules above."
+        )
+    else:
+        user += "Return ONLY the strict InvestigationPlan JSON."
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def _evidence_text(evidence: Any) -> str:
+    """Render the evidence inventory (dicts or EvidenceItems) for the prompt."""
+    items: list[EvidenceItem] = []
+    for item in evidence or []:
+        if isinstance(item, EvidenceItem):
+            items.append(item)
+        elif isinstance(item, dict):
+            try:
+                items.append(EvidenceItem(**item))
+            except (TypeError, ValueError):
+                continue
+    return evidence_summary(items)
+
+
+def _json_safe(value: Any) -> Any:
+    """Convert pydantic models/objects into JSON-serializable structures."""
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    return value
+
+
+_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+
+
+def _extract_json(raw: str) -> str:
+    """Pull a JSON object out of an LLM response (fences, prose, etc.)."""
+    text = raw.strip()
+    if not text:
+        raise ValueError("LLM returned an empty response")
+    fenced = _FENCE_RE.findall(text)
+    if fenced:
+        text = fenced[0].strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("LLM response contains no JSON object")
+    return text[start : end + 1]
+
+
+def _parse_plan_json(raw: str, goal: str) -> InvestigationPlan:
+    """Strictly validate an LLM plan response into an InvestigationPlan."""
+    payload = json.loads(_extract_json(raw))
+    if not isinstance(payload, dict):
+        raise ValueError("LLM plan JSON is not an object")
+    if not payload.get("goal"):
+        payload["goal"] = goal
+    return InvestigationPlan.model_validate(payload)
+
+
+class _BaseChatPlanner:
+    """Shared plumbing for chat-completion planner backends.
+
+    Subclasses implement :meth:`_complete` (turn a message list into the raw
+    completion text) and set ``backend_name``. Plan/replan validation, the
+    semantic prompt, and JSON repair live here so future providers stay thin.
     """
 
-    def __init__(
-        self,
-        model: str | None = None,
-        base_url: str = "http://localhost:11434",
-        temperature: float = 0.0,
-    ) -> None:
-        self._model = model or REASONING_MODEL
-        self._base_url = base_url
-        self._temperature = temperature
-        self._llm: Any = None
+    backend_name = "chat"
 
-    def _get_llm(self) -> Any:
-        if self._llm is None:
-            try:
-                from langchain_ollama import ChatOllama
-            except ImportError as exc:
-                raise RuntimeError(
-                    "OllamaPlanner requires 'langchain-ollama'. "
-                    "Install it or use DeterministicPlanner for offline runs."
-                ) from exc
-            self._llm = ChatOllama(
-                model=self._model,
-                base_url=self._base_url,
-                temperature=self._temperature,
-            )
-        return self._llm
+    def __init__(self, model: str | None = None, temperature: float = 0.0) -> None:
+        self._model = model or LMSTUDIO_MODEL
+        self._temperature = temperature
+        self.last_usage: dict[str, Any] | None = None
 
     def generate_plan(self, goal: str, state_summary: dict[str, Any] | None = None) -> InvestigationPlan:
         return self._ask(goal, state_summary or {}, replan=False)
@@ -373,6 +509,9 @@ class OllamaPlanner:
     ) -> InvestigationPlan:
         return self._ask(goal, state_summary or {}, replan=True, previous_plan=previous_plan)
 
+    def is_available(self) -> bool:
+        return True
+
     def _ask(
         self,
         goal: str,
@@ -381,35 +520,151 @@ class OllamaPlanner:
         replan: bool,
         previous_plan: InvestigationPlan | None = None,
     ) -> InvestigationPlan:
-        from langchain_core.output_parsers import JsonOutputParser
-        from langchain_core.prompts import ChatPromptTemplate
+        messages = _build_messages(goal, state_summary, replan=replan, previous_plan=previous_plan)
+        raw = self._complete(messages)
+        return _parse_plan_json(raw, goal)
 
-        parser = JsonOutputParser()
-        human = "goal: {goal}\ncase state summary: {state}\n"
-        if replan:
-            human += "previous plan (JSON): {previous_plan}\nReturn a REVISED minimal plan."
-        else:
-            human += "Return ONLY a minimal JSON plan."
-        prompt = ChatPromptTemplate.from_messages(
-            [("system", _SYSTEM_PROMPT), ("human", human)]
+    def _complete(self, messages: list[dict[str, str]]) -> str:
+        raise NotImplementedError
+
+
+class LMStudioPlanner(_BaseChatPlanner):
+    """LM Studio-backed planner via the OpenAI-compatible REST endpoint.
+
+    Communicates with ``base_url`` (default ``http://localhost:1234/v1``) using
+    the OpenAI Python SDK. LM Studio manages model execution; this class never
+    loads weights or uses transformers. All settings are configurable through
+    constructor kwargs (defaults come from ``karuth.config``), so switching
+    models or servers requires no planner code changes.
+    """
+
+    backend_name = "lmstudio"
+
+    def __init__(
+        self,
+        model: str | None = None,
+        base_url: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        timeout: float | None = None,
+        api_key: str = "lm-studio",
+        client: Any = None,
+    ) -> None:
+        super().__init__(
+            model=model or LMSTUDIO_MODEL,
+            temperature=LMSTUDIO_TEMPERATURE if temperature is None else temperature,
         )
-        chain = prompt | self._get_llm() | parser
-        raw = chain.invoke(
-            {
-                "goal": goal,
-                "state": json.dumps(state_summary, sort_keys=True),
-                "previous_plan": (
-                    previous_plan.model_dump(mode="json") if previous_plan else None
-                ),
+        self._base_url = base_url or LMSTUDIO_BASE_URL
+        self._max_tokens = max_tokens or LMSTUDIO_MAX_TOKENS
+        self._timeout = LMSTUDIO_TIMEOUT if timeout is None else timeout
+        self._api_key = api_key
+        self._client = client  # injectable for tests; avoids importing openai
+
+    def _get_client(self) -> Any:
+        if self._client is None:
+            from openai import OpenAI
+
+            self._client = OpenAI(
+                base_url=self._base_url,
+                api_key=self._api_key,
+                timeout=self._timeout,
+            )
+        return self._client
+
+    def _complete(self, messages: list[dict[str, str]]) -> str:
+        client = self._get_client()
+        response = client.chat.completions.create(
+            model=self._model,
+            messages=messages,
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+            timeout=self._timeout,
+        )
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            self.last_usage = {
+                key: getattr(usage, key)
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                if hasattr(usage, key)
             }
-        )
-        return InvestigationPlan.model_validate(raw)
+        content = response.choices[0].message.content
+        return content if isinstance(content, str) else json.dumps(content)
 
 
-def build_planner(backend: str = "deterministic", **kwargs: Any) -> PlannerLLM:
-    """Factory for the planning backend; defaults to the offline backend."""
+class FallbackPlanner:
+    """Wrap a primary planner; delegate to a deterministic planner on failure.
+
+    Catches timeouts, invalid JSON, unavailable models, and any other planner
+    exception, records the fallback, and produces a deterministic plan so the
+    investigation never dead-ends because the LLM backend is down.
+    """
+
+    backend_name = "fallback"
+
+    def __init__(self, primary: PlannerLLM, fallback: PlannerLLM | None = None) -> None:
+        self._primary = primary
+        self._fallback = fallback or DeterministicPlanner()
+        self.last_error: str | None = None
+        self.last_backend: str | None = None  # which backend actually produced the last plan
+
+    @property
+    def primary(self) -> PlannerLLM:
+        return self._primary
+
+    @property
+    def fallback(self) -> PlannerLLM:
+        return self._fallback
+
+    @property
+    def _model(self) -> str:
+        return getattr(self._primary, "_model", "")
+
+    @property
+    def last_usage(self) -> dict[str, Any] | None:
+        return getattr(self._primary, "last_usage", None)
+
+    def generate_plan(self, goal: str, state_summary: dict[str, Any] | None = None) -> InvestigationPlan:
+        try:
+            plan = self._primary.generate_plan(goal, state_summary)
+            self.last_backend = getattr(self._primary, "backend_name", "primary")
+            return plan
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.last_backend = getattr(self._fallback, "backend_name", "deterministic")
+            return self._fallback.generate_plan(goal, state_summary)
+
+    def replan(
+        self,
+        goal: str,
+        state_summary: dict[str, Any] | None = None,
+        previous_plan: InvestigationPlan | None = None,
+    ) -> InvestigationPlan:
+        try:
+            plan = self._primary.replan(goal, state_summary, previous_plan)
+            self.last_backend = getattr(self._primary, "backend_name", "primary")
+            return plan
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.last_backend = getattr(self._fallback, "backend_name", "deterministic")
+            return self._fallback.replan(goal, state_summary, previous_plan)
+
+    def is_available(self) -> bool:
+        return True
+
+
+def build_planner(backend: str = "lmstudio", *, fallback: bool = True, **kwargs: Any) -> PlannerLLM:
+    """Factory for the planning backend; defaults to the LLM backend.
+
+    The default experience is LLM-backed planning (LM Studio by default);
+    ``fallback=True`` (default) wraps LLM backends in :class:`FallbackPlanner`
+    so a timeout, unavailable model, or invalid JSON response degrades to the
+    deterministic planner automatically. Pass ``backend="deterministic"`` to
+    force the offline keyword-based planner.
+
+    ``backend`` may be ``"lmstudio"`` or ``"deterministic"``.
+    """
     if backend == "deterministic":
         return DeterministicPlanner()
-    if backend == "ollama":
-        return OllamaPlanner(**kwargs)
+    if backend == "lmstudio":
+        return FallbackPlanner(LMStudioPlanner(**kwargs)) if fallback else LMStudioPlanner(**kwargs)
     raise ValueError(f"Unknown planner backend: {backend}")

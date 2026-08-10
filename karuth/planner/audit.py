@@ -43,6 +43,35 @@ class PlannerAuditor:
     def goal_received(self, goal: str) -> LedgerEntry:
         return self._append("agent_action", "goal_received", "goal", {"goal": goal})
 
+    def planning_backend(self, backend: str, model: str = "") -> LedgerEntry:
+        return self._append(
+            "agent_action", "planning_backend", "plan", {"backend": backend, "model": model}
+        )
+
+    def evidence_inventory(self, evidence: list[dict]) -> LedgerEntry:
+        return self._append(
+            "agent_action",
+            "evidence_inventory",
+            "case_evidence",
+            {"evidence": evidence},
+        )
+
+    def task_skipped(self, tool: str, reason: str) -> LedgerEntry:
+        return self._append(
+            "agent_action", "task_skipped", "task", {"tool": tool, "reason": reason}
+        )
+
+    def fallback_used(self, backend: str, error: str) -> LedgerEntry:
+        return self._append(
+            "agent_action",
+            "fallback_used",
+            "plan",
+            {"fallback": "DeterministicPlanner", "primary": backend, "error": error},
+        )
+
+    def goal_completed(self, summary: dict) -> LedgerEntry:
+        return self._append("agent_action", "goal_completed", "goal", summary)
+
     def plan_generated(self, plan: InvestigationPlan, *, replan: bool = False) -> LedgerEntry:
         return self._append(
             "agent_action",
@@ -120,6 +149,11 @@ class PlannerAuditor:
             "review_decision",
             target,
             {"decision": decision, "note": note},
+        )
+
+    def authorization_granted(self, target: str) -> LedgerEntry:
+        return self._append(
+            "review_action", "authorization_granted", target, {"granted": True}
         )
 
     # ---- export -----------------------------------------------------------

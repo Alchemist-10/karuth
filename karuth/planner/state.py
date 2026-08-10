@@ -2,7 +2,10 @@
 
 The state tracks the dynamic execution plan, evidence, risk classification,
 reveal authorization, and planner notes so downstream code can inspect exactly
-what happened and why.
+what happened and why. Part 7 fields — available evidence, tool/execution
+history, planner thoughts, confidence, remaining objectives, iteration count,
+token usage, model, and timing — make the reasoning loop inspectable and
+auditable.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ from typing import TypedDict
 
 from karuth.correlation.candidate_matcher import CorrelationResult
 from karuth.entities.schema import Entity
+from karuth.planner.evidence import EvidenceItem
 from karuth.planner.schema import InvestigationPlan, PlannerTask
 
 
@@ -40,6 +44,23 @@ class PlannerState(TypedDict, total=False):
     final_result: str
     plan_hash: str
 
+    # ---- dynamic-execution loop (Part 4) ---------------------------------
+    current_task: PlannerTask
+    next_action: str
+    replan_reason: str
+
+    # ---- richer state (Part 7) -------------------------------------------
+    available_evidence: list[EvidenceItem]
+    tool_history: list[dict]
+    execution_history: list[dict]
+    planner_thoughts: list[str]
+    confidence: float
+    remaining_objectives: list[str]
+    planner_iteration_count: int
+    token_usage: dict
+    model_used: str
+    timing: dict
+
 
 def initial_state(
     case_id: str,
@@ -64,4 +85,16 @@ def initial_state(
         "stop_early": False,
         "last_dispatch_had_work": False,
         "replan_count": 0,
+        "next_action": "plan",
+        "replan_reason": "",
+        "available_evidence": [],
+        "tool_history": [],
+        "execution_history": [],
+        "planner_thoughts": [],
+        "confidence": 0.0,
+        "remaining_objectives": [],
+        "planner_iteration_count": 0,
+        "token_usage": {},
+        "model_used": "none",
+        "timing": {},
     }

@@ -12,3 +12,11 @@ def has_entities(entities: list[Entity]) -> bool:
 
 def has_matches(matches: list[CorrelationResult]) -> bool:
     return bool(matches)
+
+
+def has_timeline(timeline: list[Entity]) -> bool:
+    return bool(timeline)
+
+
+def has_ranked_matches(ranked_matches: list[CorrelationResult]) -> bool:
+    return bool(ranked_matches)

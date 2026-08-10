@@ -46,3 +46,10 @@ class InvestigationPlan(BaseModel):
     tasks: list[PlannerTask]
     expected_output: list[str] = Field(default_factory=list)
     stop_conditions: list[str] = Field(default_factory=list)
+    reasoning_summary: str = Field(
+        default="",
+        description=(
+            "Audit-safe, concise explanation of why these tools were chosen and "
+            "when the investigation can stop. Never chain-of-thought."
+        ),
+    )
