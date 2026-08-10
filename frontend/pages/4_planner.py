@@ -1,1 +1,156 @@
-"""Streamlit planner page stub."""
+"""Streamlit planner page: enter an investigator prompt and get an LLM-backed
+plan and result from the agentic planner.
+
+The page runs the planner in-process (offline-first): the goal is sent to the
+default LLM backend (LM Studio) and automatically falls back to the
+deterministic planner when the LLM server is unreachable. Guardrails, review
+authorization, and the hash-chained ledger are enforced by the planner. The
+same flow is available headlessly via ``POST /planner/goal``.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import streamlit as st
+
+from karuth.config import DEFAULT_DATA_DIR
+from karuth.ledger import LedgerStore
+from karuth.planner.llm import build_planner
+from karuth.planner.state_machine import run_planner_goal
+
+ROOT = Path(__file__).resolve().parent.parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+
+def _generate_demo_case(case_folder: Path) -> None:
+    from scripts.generate_synthetic_case import generate_case
+
+    generate_case(case_folder)
+
+
+st.set_page_config(page_title="Planner", page_icon="🧭", layout="wide")
+st.title("Agentic Investigation Planner")
+st.caption(
+    "Type an investigator goal; the planner reasons over the case evidence and schedules "
+    "deterministic tools one at a time, then reports the result."
+)
+
+with st.sidebar:
+    st.header("Case")
+    case_id = st.text_input("Case ID", value="case-demo")
+    case_folder = st.text_input(
+        "Case folder",
+        value=str(DEFAULT_DATA_DIR / case_id),
+        help="Folder containing the evidence (chats/, images/, bank/, ...).",
+    )
+    if st.button("Generate synthetic demo case", use_container_width=True):
+        with st.spinner("Generating synthetic evidence..."):
+            _generate_demo_case(Path(case_folder))
+        st.success(f"Demo case written to {case_folder}")
+
+    st.divider()
+    st.header("Planner backend")
+    backend = st.radio(
+        "Backend",
+        options=["lmstudio", "deterministic"],
+        index=0,
+        format_func=lambda b: {
+            "lmstudio": "LM Studio (LLM, falls back to deterministic)",
+            "deterministic": "Deterministic (offline keyword)",
+        }[b],
+        help="Default experience is LLM-backed; deterministic stays available and is used automatically when the LLM fails.",
+    )
+    reveal_authorized = st.checkbox(
+        "Reveal authorized (CRITICAL dual authorization granted)",
+        value=False,
+    )
+
+goal = st.text_area(
+    "Investigator goal",
+    value="Find links for vehicle KL07CX4242 and triage the top leads",
+    height=90,
+)
+
+if st.button("Run planner", type="primary", use_container_width=True):
+    if not goal.strip():
+        st.error("Enter a goal first.")
+        st.stop()
+
+    case_path = Path(case_folder)
+    case_path.mkdir(parents=True, exist_ok=True)
+    ledger = LedgerStore(DEFAULT_DATA_DIR / f"{case_id}.sqlite3")
+
+    planner = build_planner(backend)
+    with st.spinner("Planning and executing (LLM planning with deterministic tools)..."):
+        try:
+            state = run_planner_goal(
+                case_id,
+                case_path,
+                goal.strip(),
+                ledger,
+                planner=planner,
+                reveal_authorized=reveal_authorized,
+            )
+        except ValueError as exc:
+            st.error(f"Goal rejected by guardrails: {exc}")
+            st.stop()
+
+    st.subheader("Result")
+    st.markdown(state.get("final_result") or "_no result_")
+
+    backend_used = getattr(planner, "last_backend", backend)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Risk tier", state.get("risk_tier", "LOW"))
+    c2.metric("Confidence", f"{state.get('confidence', 0.0):.2f}")
+    c3.metric("Backend used", backend_used)
+    c4.metric("Iterations", state.get("planner_iteration_count", 0))
+    c5.metric("Ledger entries", len(ledger.list_entries(case_id)))
+    c6.metric("Ledger verified", "✓" if ledger.verify() else "✗")
+
+    st.subheader("Plan")
+    plan = state.get("plan")
+    if plan is not None:
+        st.dataframe(
+            [
+                {
+                    "step": task.step,
+                    "tool": task.tool,
+                    "reason": task.reason,
+                }
+                for task in plan.tasks
+            ],
+            use_container_width=True,
+        )
+        st.caption(
+            f"Review required: {state.get('needs_human_review', False)} · "
+            f"Authorization required: {state.get('needs_authorization', False)}"
+        )
+    else:
+        st.info("No plan was produced.")
+
+    with st.expander("Execution history"):
+        st.json(state.get("execution_history", []))
+    with st.expander("Planner thoughts"):
+        st.write(state.get("planner_thoughts", []))
+    with st.expander("Notes / audit trail"):
+        st.write(state.get("notes", []))
+    with st.expander("Ledger entries"):
+        rows = [
+            {
+                "seq": entry.sequence,
+                "action": entry.action,
+                "actor": entry.actor,
+                "payload": entry.payload,
+            }
+            for entry in ledger.list_entries(case_id)
+        ]
+        st.json(rows)
+
+    st.divider()
+    st.caption(
+        "Same flow headlessly:  POST /planner/goal  with "
+        '{"case_id": "...", "goal": "..."} on the FastAPI app.'
+    )
