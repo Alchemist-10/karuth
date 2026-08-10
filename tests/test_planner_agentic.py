@@ -9,7 +9,12 @@ import pytest
 
 from scripts.generate_synthetic_case import generate_case
 from karuth.ledger import LedgerStore
-from karuth.planner.llm import DeterministicPlanner, OllamaPlanner, build_planner
+from karuth.planner.llm import (
+    DeterministicPlanner,
+    FallbackPlanner,
+    LMStudioPlanner,
+    build_planner,
+)
 from karuth.planner.schema import InvestigationPlan, PlannerTask
 from karuth.planner.state_machine import run_planner_goal
 
@@ -46,7 +51,9 @@ def test_different_goals_produce_different_task_lists(tmp_path):
     plans = {}
     for label, goal in GOALS.items():
         ledger = LedgerStore(tmp_path / f"ledger_{label}.sqlite3")
-        state = run_planner_goal("CASE-1", case_dir, goal, ledger)
+        state = run_planner_goal(
+            "CASE-1", case_dir, goal, ledger, planner=DeterministicPlanner()
+        )
         plans[label] = _tool_set(state)
 
     assert plans["network"] == {
@@ -76,7 +83,9 @@ def test_planner_stops_early_without_evidence(tmp_path):
     case_dir = _empty_case(tmp_path)
     ledger = LedgerStore(tmp_path / "ledger.sqlite3")
 
-    state = run_planner_goal("CASE-1", case_dir, "Investigate this case", ledger)
+    state = run_planner_goal(
+        "CASE-1", case_dir, "Investigate this case", ledger, planner=DeterministicPlanner()
+    )
 
     assert state["entities"] == []
     assert state["stop_early"] is True
@@ -92,7 +101,13 @@ def test_planner_selects_legal_only_when_appropriate(tmp_path):
     generate_case(case_dir)
     ledger = LedgerStore(tmp_path / "ledger.sqlite3")
 
-    state = run_planner_goal("CASE-1", case_dir, "Generate the legal certificate for this case.", ledger)
+    state = run_planner_goal(
+        "CASE-1",
+        case_dir,
+        "Generate the legal certificate for this case.",
+        ledger,
+        planner=DeterministicPlanner(),
+    )
 
     assert "LegalActionAgent" in _tool_set(state)
     assert "ReportAgent" in _tool_set(state)
@@ -103,7 +118,13 @@ def test_planner_selects_legal_only_when_appropriate(tmp_path):
     assert ledger.verify()
 
     ledger2 = LedgerStore(tmp_path / "ledger2.sqlite3")
-    state2 = run_planner_goal("CASE-1", case_dir, "Find links for vehicle KL07CX4242", ledger2)
+    state2 = run_planner_goal(
+        "CASE-1",
+        case_dir,
+        "Find links for vehicle KL07CX4242",
+        ledger2,
+        planner=DeterministicPlanner(),
+    )
     assert "LegalActionAgent" not in _tool_set(state2)
 
 
@@ -131,7 +152,9 @@ def test_planner_respects_med_risk_with_blurred_preview(tmp_path):
     generate_case(case_dir)
     ledger = LedgerStore(tmp_path / "ledger.sqlite3")
 
-    state = run_planner_goal("CASE-1", case_dir, GOALS["sensitive"], ledger)
+    state = run_planner_goal(
+        "CASE-1", case_dir, GOALS["sensitive"], ledger, planner=DeterministicPlanner()
+    )
 
     assert state["plan"].safety_policy.risk_level == "MED"
     assert state["plan"].safety_policy.blur_by_default is True
@@ -155,6 +178,7 @@ def test_planner_critical_requires_dual_authorization(tmp_path):
         case_dir,
         "Reveal the critical credentials found in the chat.",
         ledger,
+        planner=DeterministicPlanner(),
     )
 
     assert state["plan"].safety_policy.risk_level == "CRITICAL"
@@ -175,6 +199,7 @@ def test_planner_critical_reveal_after_authorization(tmp_path):
         case_dir,
         "Reveal the critical credentials found in the chat.",
         ledger,
+        planner=DeterministicPlanner(),
         reveal_authorized=True,
     )
 
@@ -194,24 +219,21 @@ def test_ledger_chain_remains_verifiable_across_runs(tmp_path):
     ledger = LedgerStore(tmp_path / "ledger.sqlite3")
 
     for goal in GOALS.values():
-        run_planner_goal("CASE-1", case_dir, goal, ledger)
+        run_planner_goal(
+            "CASE-1", case_dir, goal, ledger, planner=DeterministicPlanner()
+        )
         assert ledger.verify()
 
 
-def test_planner_default_backend_is_deterministic():
+def test_planner_default_backend_is_llm_first_with_fallback():
     planner = build_planner()
-    assert isinstance(planner, DeterministicPlanner)
+    assert isinstance(planner, FallbackPlanner)
+    assert isinstance(planner.primary, LMStudioPlanner)
+    assert isinstance(planner.fallback, DeterministicPlanner)
 
 
-def test_ollama_backend_requires_langchain_ollama():
-    try:
-        import langchain_ollama  # noqa: F401
-    except ImportError:
-        planner = OllamaPlanner()
-        with pytest.raises(RuntimeError, match="langchain-ollama"):
-            planner._get_llm()
-    else:
-        pytest.skip("langchain-ollama installed; offline failure path not testable")
+def test_deterministic_backend_is_explicitly_selectable():
+    assert isinstance(build_planner("deterministic"), DeterministicPlanner)
 
 
 def test_custom_planner_backend_is_injected(tmp_path):

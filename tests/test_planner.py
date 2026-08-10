@@ -5,6 +5,7 @@ import pytest
 from scripts.generate_synthetic_case import generate_case
 from karuth.ledger import LedgerStore
 from karuth.planner.guardrails import assert_plan_safe, ensure_inside_case, reject_external_url
+from karuth.planner.llm import DeterministicPlanner
 from karuth.planner.schema import InvestigationPlan, PlannerTask
 from karuth.planner.state_machine import run_planner_goal
 
@@ -19,6 +20,7 @@ def test_planner_produces_dynamic_plan_and_audits(tmp_path):
         case_dir,
         "Find links for vehicle KL07CX4242 and triage the top leads",
         ledger,
+        planner=DeterministicPlanner(),
     )
 
     assert state["entities"]
