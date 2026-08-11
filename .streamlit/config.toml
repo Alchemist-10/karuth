@@ -1,0 +1,11 @@
+# Karuth Streamlit theme — dark cyber palette matching the graph widget.
+# Values here are the base; frontend/components/theme.py injects the
+# full neon/glow styling on top of this foundation.
+
+[theme]
+base = "dark"
+primaryColor = "#22d3ee"
+backgroundColor = "#05070f"
+secondaryBackgroundColor = "#0b1220"
+textColor = "#dbe4f0"
+font = "sans serif"
