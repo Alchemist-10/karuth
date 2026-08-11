@@ -64,6 +64,11 @@ def _summary(state: PlannerState) -> dict[str, object]:
         "planner_iteration_count": state.get("planner_iteration_count", 0),
         "replan_count": state.get("replan_count", 0),
         "replan_reason": state.get("replan_reason", ""),
+        "failed_tools": [
+            entry["tool"]
+            for entry in state.get("execution_history", [])
+            if entry.get("status") == "failed"
+        ],
         "notes": state.get("notes", []),
     }
 
