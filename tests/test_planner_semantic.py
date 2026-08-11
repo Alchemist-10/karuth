@@ -17,6 +17,7 @@ from karuth.planner.llm import (
     DeterministicPlanner,
     FallbackPlanner,
     LMStudioPlanner,
+    OpenRouterPlanner,
     PlannerLLM,
     build_planner,
 )
@@ -234,6 +235,56 @@ def test_lmstudio_planner_repairs_fenced_json():
     ]
 
 
+def test_openrouter_configuration_is_configurable_via_factory():
+    planner = build_planner(
+        "openrouter",
+        fallback=False,
+        model="openai/gpt-4o-mini",
+        base_url="https://openrouter.ai/api/v1",
+        temperature=0.2,
+        max_tokens=400,
+        timeout=30.0,
+        api_key="test-key",
+    )
+    assert isinstance(planner, OpenRouterPlanner)
+    assert planner._model == "openai/gpt-4o-mini"
+    assert planner._base_url == "https://openrouter.ai/api/v1"
+    assert planner._temperature == 0.2
+    assert planner._max_tokens == 400
+    assert planner._timeout == 30.0
+    assert planner._api_key == "test-key"
+
+
+def test_openrouter_refuses_without_api_key():
+    import os
+
+    planner = OpenRouterPlanner(api_key=None)
+    assert planner._api_key == os.environ.get("OPENROUTER_API_KEY", "")
+    if not planner._api_key:
+        with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY"):
+            planner._get_client()
+
+
+def test_openrouter_falls_back_to_deterministic_on_failure(tmp_path):
+    """OpenRouter errors (bad key, network, invalid JSON) degrade to the
+    deterministic planner via FallbackPlanner, exactly like LM Studio."""
+    case_dir = tmp_path / "synthetic_case"
+    generate_case(case_dir)
+    ledger = LedgerStore(tmp_path / "ledger.sqlite3")
+
+    planner = FallbackPlanner(OpenRouterPlanner(client=_FakeClient("not json at all"), api_key="x"))
+    state = run_planner_goal(
+        "CASE-1",
+        case_dir,
+        "Find links for vehicle KL07CX4242",
+        ledger,
+        planner=planner,
+    )
+    assert state["final_result"]
+    assert "fallback_used" in [entry.action for entry in ledger.list_entries()]
+    assert ledger.verify()
+
+
 def test_lmstudio_configuration_is_configurable_via_factory():
     planner = build_planner(
         "lmstudio",
@@ -253,23 +304,31 @@ def test_lmstudio_configuration_is_configurable_via_factory():
 
 
 def test_build_planner_factory_provider_abstraction():
+    # The default backend is OpenRouter (remote LLM planning), wrapped in the
+    # deterministic fallback so an unreachable/unauthorized LLM never dead-ends.
     default = build_planner()
     assert isinstance(default, FallbackPlanner)
-    assert isinstance(default.primary, LMStudioPlanner)
+    assert isinstance(default.primary, OpenRouterPlanner)
     assert isinstance(default.fallback, DeterministicPlanner)
 
     assert isinstance(build_planner("deterministic"), DeterministicPlanner)
 
-    wrapped = build_planner("lmstudio")
-    assert isinstance(wrapped, FallbackPlanner)
-    assert isinstance(wrapped.primary, LMStudioPlanner)
-    assert isinstance(wrapped.fallback, DeterministicPlanner)
+    lmstudio = build_planner("lmstudio")
+    assert isinstance(lmstudio, FallbackPlanner)
+    assert isinstance(lmstudio.primary, LMStudioPlanner)
+    assert isinstance(lmstudio.fallback, DeterministicPlanner)
 
     assert isinstance(build_planner("lmstudio", fallback=False), LMStudioPlanner)
 
+    openrouter = build_planner("openrouter")
+    assert isinstance(openrouter, FallbackPlanner)
+    assert isinstance(openrouter.primary, OpenRouterPlanner)
+    assert isinstance(openrouter.fallback, DeterministicPlanner)
+    assert isinstance(build_planner("openrouter", fallback=False), OpenRouterPlanner)
+
     with pytest.raises(ValueError, match="Unknown planner backend"):
         build_planner("bogus")
-    # Ollama was removed; only LM Studio and deterministic remain.
+    # Ollama was removed; only LM Studio, OpenRouter, and deterministic remain.
     with pytest.raises(ValueError, match="Unknown planner backend"):
         build_planner("ollama")
 
@@ -331,8 +390,8 @@ def test_run_planner_goal_defaults_to_llm_first_and_falls_back(tmp_path, monkeyp
 
     import karuth.planner.state_machine as sm
 
-    def _failing_default(backend: str = "lmstudio", **kwargs):
-        assert backend == "lmstudio"
+    def _failing_default(backend: str = "openrouter", **kwargs):
+        assert backend == "openrouter"
         return FallbackPlanner(_FailingPlanner())
 
     monkeypatch.setattr(sm, "build_planner", _failing_default)
@@ -625,15 +684,18 @@ def test_tool_registry_metadata_is_complete():
         "TriageAgent",
         "ReportAgent",
         "LegalActionAgent",
+        "VisionAgent",
     }
     for name, spec in TOOL_REGISTRY.items():
         assert spec.description
         assert spec.capabilities
-        assert spec.offline is True
         assert spec.produced_outputs
+        # VisionAgent is the only LLM-dependent tool (needs LM Studio vision).
+        assert spec.offline is (name != "VisionAgent")
     assert PRODUCER_BY_OUTPUT["entities"] == "ExtractionAgent"
     assert PRODUCER_BY_OUTPUT["matches"] == "CorrelationAgent"
     assert PRODUCER_BY_OUTPUT["report"] == "ReportAgent"
+    assert PRODUCER_BY_OUTPUT["image_transcriptions"] == "VisionAgent"
     text = tool_metadata_text()
     for name in TOOL_REGISTRY:
         assert name in text

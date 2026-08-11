@@ -44,8 +44,8 @@ def test_backends_listing(client):
     resp = client.get("/planner/backends")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["default"] == "lmstudio"
-    assert set(body["backends"]) == {"lmstudio", "deterministic"}
+    assert body["default"] == "openrouter"
+    assert set(body["backends"]) == {"lmstudio", "openrouter", "deterministic"}
 
 
 def test_planner_goal_runs_deterministic_backend(client, tmp_path):
@@ -76,7 +76,7 @@ def test_planner_goal_default_is_llm_first_and_falls_back(client, tmp_path, monk
     case_id = _seed_case(tmp_path)
     monkeypatch.setattr(
         "karuth.api.routes.planner.build_planner",
-        lambda backend="lmstudio", **kwargs: FallbackPlanner(_FailingPlanner()),
+        lambda backend="openrouter", **kwargs: FallbackPlanner(_FailingPlanner()),
     )
     resp = client.post(
         "/planner/goal",
@@ -84,7 +84,7 @@ def test_planner_goal_default_is_llm_first_and_falls_back(client, tmp_path, monk
     )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["backend"] == "lmstudio"  # the requested (default) backend
+    assert body["backend"] == "openrouter"  # the requested (default) backend
     assert body["backend_used"] == "deterministic"  # produced by the fallback
     assert body["final_result"]
     assert "ExtractionAgent" in {task["tool"] for task in body["plan"]["tasks"]}

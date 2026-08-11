@@ -13,6 +13,7 @@ from karuth.planner.llm import (
     DeterministicPlanner,
     FallbackPlanner,
     LMStudioPlanner,
+    OpenRouterPlanner,
     build_planner,
 )
 from karuth.planner.schema import InvestigationPlan, PlannerTask
@@ -228,8 +229,11 @@ def test_ledger_chain_remains_verifiable_across_runs(tmp_path):
 def test_planner_default_backend_is_llm_first_with_fallback():
     planner = build_planner()
     assert isinstance(planner, FallbackPlanner)
-    assert isinstance(planner.primary, LMStudioPlanner)
+    assert isinstance(planner.primary, OpenRouterPlanner)  # remote LLM default
     assert isinstance(planner.fallback, DeterministicPlanner)
+
+    offline = build_planner("lmstudio")  # fully offline LLM option
+    assert isinstance(offline.primary, LMStudioPlanner)
 
 
 def test_deterministic_backend_is_explicitly_selectable():
