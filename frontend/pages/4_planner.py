@@ -1,11 +1,12 @@
 """Streamlit planner page: enter an investigator prompt and get an LLM-backed
 plan and result from the agentic planner.
 
-The page runs the planner in-process (offline-first): the goal is sent to the
-default LLM backend (LM Studio) and automatically falls back to the
-deterministic planner when the LLM server is unreachable. Guardrails, review
-authorization, and the hash-chained ledger are enforced by the planner. The
-same flow is available headlessly via ``POST /planner/goal``.
+The page runs the planner in-process: the goal is sent to the default LLM
+backend (OpenRouter by default; LM Studio is the fully offline option) and
+automatically falls back to the deterministic planner when the LLM is
+unreachable or unauthenticated. Guardrails, review authorization, and the
+hash-chained ledger are enforced by the planner. The same flow is available
+headlessly via ``POST /planner/goal``.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from pathlib import Path
 
 import streamlit as st
 
+from components.theme import apply_theme
 from karuth.config import DEFAULT_DATA_DIR
 from karuth.ledger import LedgerStore
 from karuth.planner.llm import build_planner
@@ -32,6 +34,7 @@ def _generate_demo_case(case_folder: Path) -> None:
 
 
 st.set_page_config(page_title="Planner", page_icon="🧭", layout="wide")
+apply_theme()
 st.title("Agentic Investigation Planner")
 st.caption(
     "Type an investigator goal; the planner reasons over the case evidence and schedules "
@@ -55,13 +58,14 @@ with st.sidebar:
     st.header("Planner backend")
     backend = st.radio(
         "Backend",
-        options=["lmstudio", "deterministic"],
+        options=["openrouter", "lmstudio", "deterministic"],
         index=0,
         format_func=lambda b: {
-            "lmstudio": "LM Studio (LLM, falls back to deterministic)",
+            "openrouter": "OpenRouter (default; remote LLM, sends case state to a third party)",
+            "lmstudio": "LM Studio (offline LLM, falls back to deterministic)",
             "deterministic": "Deterministic (offline keyword)",
         }[b],
-        help="Default experience is LLM-backed; deterministic stays available and is used automatically when the LLM fails.",
+        help="OpenRouter (default) sends case state summaries to a third-party service; only use it for testing, never real casework. LM Studio keeps evidence on this machine. Deterministic is fully offline. All backends fall back to deterministic when the LLM is unreachable.",
     )
     reveal_authorized = st.checkbox(
         "Reveal authorized (CRITICAL dual authorization granted)",

@@ -1,11 +1,12 @@
 """Planner API routes: run an investigator prompt through the agentic planner.
 
 ``POST /planner/goal`` accepts a free-text prompt and returns the LLM-backed
-plan and final result. The default backend is LM Studio (LLM planning) wrapped
-in a deterministic fallback, so a prompt always produces a plan even when the
-LLM server is unreachable. Guardrails, review authorization, and the hash-
-chained ledger are enforced by the planner itself; this layer only translates
-requests and responses.
+plan and final result. The default backend is OpenRouter (LLM planning, models
+run remotely) wrapped in a deterministic fallback, so a prompt always produces
+a plan even when the LLM is unreachable or unauthenticated. ``lmstudio`` is
+the fully offline alternative. Guardrails, review authorization, and the
+hash-chained ledger are enforced by the planner itself; this layer only
+translates requests and responses.
 """
 
 from __future__ import annotations
@@ -20,8 +21,8 @@ from karuth.planner.state_machine import run_planner_goal
 
 router = APIRouter(prefix="/planner", tags=["planner"])
 
-VALID_BACKENDS = ("lmstudio", "deterministic")
-DEFAULT_BACKEND = "lmstudio"
+VALID_BACKENDS = ("lmstudio", "openrouter", "deterministic")
+DEFAULT_BACKEND = "openrouter"
 
 
 class PlannerGoalRequest(BaseModel):
@@ -32,7 +33,10 @@ class PlannerGoalRequest(BaseModel):
     goal: str = Field(min_length=1, description="Free-text investigator goal / prompt.")
     backend: str = Field(
         default=DEFAULT_BACKEND,
-        description="Planner backend: 'lmstudio' (default, LLM + fallback) or 'deterministic'.",
+        description=(
+            "Planner backend: 'openrouter' (default, remote LLM + fallback), "
+            "'lmstudio' (offline LLM), or 'deterministic' (offline keyword)."
+        ),
     )
     reveal_authorized: bool = Field(
         default=False,

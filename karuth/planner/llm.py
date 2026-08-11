@@ -7,10 +7,18 @@ modify extracted entities, perform matching, or bypass guardrails.
 
 Backends
 --------
-- ``LMStudioPlanner``: the default. Talks to a local LM Studio server at an
-  OpenAI-compatible REST endpoint (``http://localhost:1234/v1``) via the
-  OpenAI Python SDK. LM Studio manages model execution; the planner never
-  loads GGUF weights or uses transformers directly.
+- ``OpenRouterPlanner``: the default. Talks to OpenRouter's OpenAI-compatible
+  REST endpoint (``https://openrouter.ai/api/v1``) via the OpenAI Python SDK,
+  which runs models on remote GPUs (fast, no local model execution). This is
+  opt-in-by-default: the API key comes from the ``OPENROUTER_API_KEY``
+  environment variable, the default model is a free-tier model, and anything
+  sent to OpenRouter is the case *state summary* (never raw evidence files
+  beyond extracted values).
+- ``LMStudioPlanner``: fully offline alternative. Talks to a local LM Studio
+  server at an OpenAI-compatible REST endpoint (``http://localhost:1234/v1``)
+  via the OpenAI Python SDK. LM Studio manages model execution; the planner
+  never loads GGUF weights or uses transformers directly. Use this when
+  evidence must never leave the machine.
 - ``DeterministicPlanner``: offline, explainable, keyword-based fallback,
   always available.
 - ``FallbackPlanner``: wraps an LLM backend and falls back to
@@ -24,6 +32,7 @@ registered in :func:`build_planner`.
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any, Protocol
 
@@ -33,6 +42,11 @@ from karuth.config import (
     LMSTUDIO_MODEL,
     LMSTUDIO_TEMPERATURE,
     LMSTUDIO_TIMEOUT,
+    OPENROUTER_BASE_URL,
+    OPENROUTER_MAX_TOKENS,
+    OPENROUTER_MODEL,
+    OPENROUTER_TEMPERATURE,
+    OPENROUTER_TIMEOUT,
 )
 from karuth.planner.evidence import EvidenceItem, evidence_summary
 from karuth.planner.schema import InvestigationPlan, PlannerTask, SafetyPolicy
@@ -298,6 +312,14 @@ class DeterministicPlanner:
         current = [task.tool for task in previous_plan.tasks] if previous_plan else []
         tools = list(current)
 
+        # Drop tools that already failed once; re-scheduling them only repeats
+        # the failure. The plan converges on the remaining tools and finalizes.
+        failed = set(state_summary.get("failed_tools", []) or [])
+        if failed:
+            tools = [tool for tool in tools if tool not in failed]
+        if not tools:
+            tools = ["ReportAgent"]
+
         if state_summary.get("match_count", 0) == 0:
             if "ExtractionAgent" not in tools:
                 tools.insert(0, "ExtractionAgent")
@@ -366,6 +388,11 @@ requires dual_authorization_required true and needs_human_review true.
 - If the goal is a legal document request, schedule LegalActionAgent with the \
 correct template input ("section_94_bnss_notice" for notices / section 94, \
 otherwise "section_63_bsa_certificate") plus ReportAgent. No evidence tools.
+- VisionAgent (LLM image transcription) is optional and only useful when the \
+case folder contains images AND the LM Studio vision model is reachable; its \
+output is LLM-generated and requires review. Never treat its output as \
+extracted evidence.
+- Never re-schedule a tool listed under failed_tools in the case state summary.
 - Keep the tool list minimal and ordered. Never schedule a tool twice.
 
 Return ONLY a JSON object matching this schema (no prose, no markdown fences):
@@ -383,7 +410,7 @@ Return ONLY a JSON object matching this schema (no prose, no markdown fences):
     {{
       "step": <int starting at 1>,
       "tool": "ExtractionAgent" | "CorrelationAgent" | "TimelineAgent" | \
-"TriageAgent" | "ReportAgent" | "LegalActionAgent",
+"TriageAgent" | "ReportAgent" | "LegalActionAgent" | "VisionAgent",
       "reason": "<audit-safe one-line reason>",
       "inputs": [],
       "fields": {{}}
@@ -522,10 +549,45 @@ class _BaseChatPlanner:
     ) -> InvestigationPlan:
         messages = _build_messages(goal, state_summary, replan=replan, previous_plan=previous_plan)
         raw = self._complete(messages)
-        return _parse_plan_json(raw, goal)
+        plan = _parse_plan_json(raw, goal)
+        if replan:
+            # Safety net: never re-schedule a tool that already failed this run.
+            failed = set(state_summary.get("failed_tools", []) or [])
+            kept = [task for task in plan.tasks if task.tool not in failed]
+            if kept and len(kept) < len(plan.tasks):
+                plan.tasks = kept
+        return plan
 
     def _complete(self, messages: list[dict[str, str]]) -> str:
         raise NotImplementedError
+
+
+_EMBEDDING_HINTS = ("embed", "embedding", "bge-", "e5-", "nomic")
+
+
+def _discover_chat_model(client: Any, preferred: str | None = None) -> str | None:
+    """Pick the first loaded chat-capable model from ``GET /v1/models``.
+
+    LM Studio reports every loaded model (embeddings included). Embedding-only
+    models cannot chat, so they are skipped. A preferred id that is actually
+    loaded wins; otherwise the first non-embedding model is returned. Returns
+    ``None`` when the server is unreachable or only embedding models are
+    loaded, so callers can fall back to their configured model name.
+    """
+    try:
+        models = client.models.list()
+    except Exception:
+        return None
+    loaded = []
+    for model in models:
+        model_id = getattr(model, "id", None)
+        if model_id and not any(hint in model_id.lower() for hint in _EMBEDDING_HINTS):
+            loaded.append(model_id)
+    if not loaded:
+        return None
+    if preferred and preferred in loaded:
+        return preferred
+    return loaded[0]
 
 
 class LMStudioPlanner(_BaseChatPlanner):
@@ -536,6 +598,11 @@ class LMStudioPlanner(_BaseChatPlanner):
     loads weights or uses transformers. All settings are configurable through
     constructor kwargs (defaults come from ``karuth.config``), so switching
     models or servers requires no planner code changes.
+
+    When no explicit model is configured (``LMSTUDIO_MODEL`` empty or
+    ``model=None``), the first loaded chat-capable model is auto-discovered
+    from ``GET /v1/models`` on first use, so a fresh LM Studio install with a
+    different model still works without editing config.
     """
 
     backend_name = "lmstudio"
@@ -559,6 +626,7 @@ class LMStudioPlanner(_BaseChatPlanner):
         self._timeout = LMSTUDIO_TIMEOUT if timeout is None else timeout
         self._api_key = api_key
         self._client = client  # injectable for tests; avoids importing openai
+        self._resolved_model: str | None = None
 
     def _get_client(self) -> Any:
         if self._client is None:
@@ -568,6 +636,90 @@ class LMStudioPlanner(_BaseChatPlanner):
                 base_url=self._base_url,
                 api_key=self._api_key,
                 timeout=self._timeout,
+                max_retries=0,  # a dead server must fail fast, not retry
+            )
+        return self._client
+
+    def _resolve_model(self) -> str:
+        """Return the model to use, auto-discovering when none is configured."""
+        if self._resolved_model:
+            return self._resolved_model
+        configured = self._model or ""
+        if configured:
+            return configured
+        discovered = _discover_chat_model(self._get_client())
+        if discovered:
+            self._resolved_model = discovered
+            return discovered
+        return ""
+
+    def _complete(self, messages: list[dict[str, str]]) -> str:
+        client = self._get_client()
+        response = client.chat.completions.create(
+            model=self._resolve_model(),
+            messages=messages,
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+            timeout=self._timeout,
+        )
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            self.last_usage = {
+                key: getattr(usage, key)
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                if hasattr(usage, key)
+            }
+        content = response.choices[0].message.content
+        return content if isinstance(content, str) else json.dumps(content)
+
+
+class OpenRouterPlanner(_BaseChatPlanner):
+    """OpenRouter-backed planner via its OpenAI-compatible REST endpoint.
+
+    OPT-IN ONLY: this backend sends the case state summary (extracted entity
+    values, match counts, evidence descriptions) to a third-party service. It
+    must never be used for real casework where evidence must stay on the
+    machine; LM Studio remains the offline default. The API key is read from
+    the ``OPENROUTER_API_KEY`` environment variable (never stored in code or
+    the ledger). Constructor kwargs override config defaults, so switching
+    models or servers needs no code changes.
+    """
+
+    backend_name = "openrouter"
+
+    def __init__(
+        self,
+        model: str | None = None,
+        base_url: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        timeout: float | None = None,
+        api_key: str | None = None,
+        client: Any = None,
+    ) -> None:
+        super().__init__(
+            model=model or OPENROUTER_MODEL,
+            temperature=OPENROUTER_TEMPERATURE if temperature is None else temperature,
+        )
+        self._base_url = base_url or OPENROUTER_BASE_URL
+        self._max_tokens = max_tokens or OPENROUTER_MAX_TOKENS
+        self._timeout = OPENROUTER_TIMEOUT if timeout is None else timeout
+        self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
+        self._client = client  # injectable for tests; avoids importing openai
+
+    def _get_client(self) -> Any:
+        if self._client is None:
+            if not self._api_key:
+                raise RuntimeError(
+                    "OPENROUTER_API_KEY is not set; refusing to call OpenRouter without a key"
+                )
+            from openai import OpenAI
+
+            self._client = OpenAI(
+                base_url=self._base_url,
+                api_key=self._api_key,
+                timeout=self._timeout,
+                max_retries=0,  # fail fast; FallbackPlanner handles errors
             )
         return self._client
 
@@ -579,6 +731,7 @@ class LMStudioPlanner(_BaseChatPlanner):
             temperature=self._temperature,
             max_tokens=self._max_tokens,
             timeout=self._timeout,
+            extra_headers={"HTTP-Referer": "https://karuth.local", "X-Title": "Karuth"},
         )
         usage = getattr(response, "usage", None)
         if usage is not None:
@@ -652,19 +805,24 @@ class FallbackPlanner:
         return True
 
 
-def build_planner(backend: str = "lmstudio", *, fallback: bool = True, **kwargs: Any) -> PlannerLLM:
-    """Factory for the planning backend; defaults to the LLM backend.
+def build_planner(backend: str = "openrouter", *, fallback: bool = True, **kwargs: Any) -> PlannerLLM:
+    """Factory for the planning backend; defaults to the OpenRouter LLM.
 
-    The default experience is LLM-backed planning (LM Studio by default);
-    ``fallback=True`` (default) wraps LLM backends in :class:`FallbackPlanner`
-    so a timeout, unavailable model, or invalid JSON response degrades to the
-    deterministic planner automatically. Pass ``backend="deterministic"`` to
-    force the offline keyword-based planner.
+    The default experience is LLM-backed planning (OpenRouter by default,
+    which runs models remotely so local planning is fast); ``fallback=True``
+    (default) wraps LLM backends in :class:`FallbackPlanner` so a timeout,
+    unavailable model, or invalid JSON response degrades to the deterministic
+    planner automatically. Pass ``backend="deterministic"`` to force the
+    offline keyword-based planner, or ``backend="lmstudio"`` for the fully
+    offline LLM backend.
 
-    ``backend`` may be ``"lmstudio"`` or ``"deterministic"``.
+    ``backend`` may be ``"openrouter"`` (default), ``"lmstudio"`` (offline
+    LLM), or ``"deterministic"``.
     """
     if backend == "deterministic":
         return DeterministicPlanner()
     if backend == "lmstudio":
         return FallbackPlanner(LMStudioPlanner(**kwargs)) if fallback else LMStudioPlanner(**kwargs)
+    if backend == "openrouter":
+        return FallbackPlanner(OpenRouterPlanner(**kwargs)) if fallback else OpenRouterPlanner(**kwargs)
     raise ValueError(f"Unknown planner backend: {backend}")

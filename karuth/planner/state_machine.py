@@ -2,13 +2,14 @@
 
 ``run_planner_goal`` keeps the original signature so callers can switch from
 the old fixed workflow to the agentic planner without changing their code. The
-planning backend defaults to the LLM (LM Studio) wrapped in a deterministic
+planning backend defaults to the LLM (OpenRouter) wrapped in a deterministic
 fallback: the default experience is LLM-backed planning, and the offline
 deterministic planner is used automatically whenever the LLM backend fails.
 Pass ``planner=DeterministicPlanner()`` (or ``build_planner("deterministic")``)
-to force the offline backend. Unexpected graph failures degrade into an
-explicit final state with a ledger trail instead of crashing; guardrail/policy
-rejections (ValueError) still propagate so callers see the rejection.
+to force the offline backend, or ``build_planner("lmstudio")`` for the fully
+offline LLM backend. Unexpected graph failures degrade into an explicit final
+state with a ledger trail instead of crashing; guardrail/policy rejections
+(ValueError) still propagate so callers see the rejection.
 """
 
 from __future__ import annotations
