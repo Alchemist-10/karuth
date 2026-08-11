@@ -43,3 +43,21 @@ tests/fixtures/synthetic_case/generated/
 .DS_Store
 Thumbs.db
 .vscode/
+.idea/
+*.swp
+*.swo
+
+# Local runtime artifacts
+.streamlit/
+.streamlit/secrets.toml
+.streamlit/credentials.toml
+*.log
+logs/
+tmp/
+temp/
+.cache/
+
+# Container / local service state
+neo4j-data/
+chroma-data/
+ollama-data/

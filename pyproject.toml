@@ -13,11 +13,18 @@ dependencies = [
     "pydantic>=2.7",
     "reportlab>=4.0",
     "langgraph>=0.2",
+    "openai>=1.30",
+    "distro>=1.9",
+    "neo4j>=5.20",
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+]
+vision = [
+    "opencv-python-headless>=4.8",
 ]
 
 [tool.pytest.ini_options]
