@@ -18,6 +18,7 @@ ToolName = Literal[
     "TriageAgent",
     "ReportAgent",
     "LegalActionAgent",
+    "VisionAgent",
 ]
 
 RiskLevel = Literal["LOW", "MED", "CRITICAL"]
