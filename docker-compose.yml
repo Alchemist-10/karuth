@@ -10,7 +10,7 @@ services:
       - neo4j-data:/data
 
   chromadb:
-    image: chromadb/chroma:latest
+    image: chromadb/chroma:latest 
     ports:
       - "127.0.0.1:8000:8000"
     volumes:

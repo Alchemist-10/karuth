@@ -12,9 +12,18 @@ PHONE_RE = re.compile(r"\+?\d{10,15}")
 PLATE_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Z]{1,2}\d{4}\b")
 
 
-def _entity_id(*parts: object) -> str:
+def entity_id(*parts: object) -> str:
+    """Deterministic entity id shared by extraction and graph ingestion.
+
+    The id is a truncated sha256 over the source material so the same value
+    from the same file always produces the same node, no matter which layer
+    (extraction, correlation sync, or graph ingestion) references it.
+    """
     material = "|".join(str(part) for part in parts)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+
+
+_entity_id = entity_id  # backward-compatible alias for existing callers
 
 
 def normalize_chat_carve(carve: dict[str, Any]) -> list[Entity]:
