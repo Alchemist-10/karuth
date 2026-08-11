@@ -21,6 +21,7 @@ ToolName = Literal[
     "TriageAgent",
     "ReportAgent",
     "LegalActionAgent",
+    "VisionAgent",
 ]
 
 CostLevel = Literal["low", "medium", "high"]
@@ -161,6 +162,38 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         supported_evidence=[],
         cost="low",
         offline=True,
+        risk="LOW",
+        review_required=True,
+    ),
+    "VisionAgent": ToolSpec(
+        name="VisionAgent",
+        description=(
+            "LLM-backed image transcription: asks the LM Studio vision model to "
+            "describe what is visible in a real image and transcribe any readable "
+            "text. Investigator assistance only -- output is LLM-generated, can "
+            "hallucinate, and must never be treated as extracted evidence."
+        ),
+        capabilities=[
+            "describe visible image content",
+            "transcribe readable text from images",
+            "identify visible objects and people",
+        ],
+        limitations=[
+            "requires an LLM vision model served by LM Studio (network dependent)",
+            "descriptions can hallucinate; never treat as extracted evidence",
+            "reads only image files from the case folder",
+        ],
+        required_inputs=[],
+        produced_outputs=[
+            ToolOutput(
+                key="image_transcriptions",
+                label="image transcriptions",
+                description="LLM descriptions of case images",
+            )
+        ],
+        supported_evidence=["images"],
+        cost="high",
+        offline=False,
         risk="LOW",
         review_required=True,
     ),
