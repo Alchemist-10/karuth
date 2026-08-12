@@ -46,6 +46,8 @@ Planning backends are swappable through `build_planner(backend, **kwargs)`:
 
 LLM backends are wrapped in `FallbackPlanner` by default, so a timeout, unavailable model, or invalid JSON response automatically falls back to the deterministic planner and is recorded in the ledger. `run_planner_goal` and `build_planner()` therefore give you the LLM-backed experience by default, degrading gracefully when no LLM server is running.
 
+LLM backends stream completions and capture the model's reasoning tokens (`last_thoughts`, forwarded to a `thoughts_callback` when configured), so the planner page can render the thinking live, xAI-style. Reasoning is **display-only** — it is never written to the ledger, which keeps only concise, audit-safe explanations.
+
 ```python
 from karuth.planner.llm import build_planner
 

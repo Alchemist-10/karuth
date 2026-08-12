@@ -189,6 +189,39 @@ hr {
 
 /* ---- spinner ----------------------------------------------------------------- */
 [data-testid="stSpinner"] { color: #7dd3fc; }
+
+/* ---- xAI-style thinking box (streamed model reasoning) ---------------------- */
+.karuth-thinking {
+  background: rgba(8, 13, 28, 0.92);
+  border: 1px solid rgba(0, 240, 255, 0.22);
+  border-left: 3px solid #00f0ff;
+  border-radius: 10px;
+  padding: 14px 18px;
+  margin: 12px 0;
+  font-family: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas,
+               "Courier New", monospace;
+  font-size: 0.85rem;
+  line-height: 1.6;
+  color: #93b7c9;
+  white-space: normal;
+  word-break: break-word;
+  box-shadow: 0 0 24px rgba(0, 240, 255, 0.06), inset 0 0 40px rgba(34, 211, 238, 0.03);
+}
+.karuth-thinking-head {
+  font-size: 0.68rem;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: #00f0ff;
+  opacity: 0.95;
+  margin-bottom: 10px;
+}
+.karuth-thinking-head .karuth-model { color: #7c93b0; letter-spacing: 0.05em; }
+.karuth-dots span { animation: karuth-blink 1.1s infinite; }
+.karuth-dots span:nth-child(2) { animation-delay: 0.18s; }
+.karuth-dots span:nth-child(3) { animation-delay: 0.36s; }
+@keyframes karuth-blink { 0%, 100% { opacity: 0.15; } 50% { opacity: 1; } }
+.karuth-cursor { color: #00f0ff; animation: karuth-cursor-blink 0.85s step-end infinite; }
+@keyframes karuth-cursor-blink { 50% { opacity: 0; } }
 """
 
 

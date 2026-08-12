@@ -11,6 +11,7 @@ headlessly via ``POST /planner/goal``.
 
 from __future__ import annotations
 
+import html
 import sys
 from pathlib import Path
 
@@ -25,6 +26,20 @@ from karuth.planner.state_machine import run_planner_goal
 ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+
+def _thinking_html(text: str, *, live: bool, model: str = "") -> str:
+    """Grok-style thinking box; ``live=True`` adds the animated dots + cursor."""
+    safe = html.escape(text).replace("\n", "<br>")
+    model_tag = f'<span class="karuth-model"> · {html.escape(model)}</span>' if model else ""
+    dots = '<span class="karuth-dots"><span>.</span><span>.</span><span>.</span></span>' if live else ""
+    cursor = '<span class="karuth-cursor">▍</span>' if live else ""
+    return (
+        '<div class="karuth-thinking">'
+        f'<div class="karuth-thinking-head">🧠 Thinking{model_tag}{dots}</div>'
+        f'<div class="karuth-thinking-body">{safe}{cursor}</div>'
+        "</div>"
+    )
 
 
 def _generate_demo_case(case_folder: Path) -> None:
@@ -87,7 +102,18 @@ if st.button("Run planner", type="primary", use_container_width=True):
     case_path.mkdir(parents=True, exist_ok=True)
     ledger = LedgerStore(DEFAULT_DATA_DIR / f"{case_id}.sqlite3")
 
-    planner = build_planner(backend)
+    thought_buffer: list[str] = []
+    thought_placeholder = st.empty()
+
+    def _on_thought(token: str) -> None:
+        thought_buffer.append(token)
+        thought_placeholder.markdown(
+            _thinking_html("".join(thought_buffer), live=True, model=model_name),
+            unsafe_allow_html=True,
+        )
+
+    planner = build_planner(backend, thoughts_callback=_on_thought)
+    model_name = getattr(planner, "_model", "") or ""
     with st.spinner("Planning and executing (LLM planning with deterministic tools)..."):
         try:
             state = run_planner_goal(
@@ -101,6 +127,19 @@ if st.button("Run planner", type="primary", use_container_width=True):
         except ValueError as exc:
             st.error(f"Goal rejected by guardrails: {exc}")
             st.stop()
+
+    thought_text = "".join(thought_buffer) or "".join(getattr(planner, "last_thoughts", []) or [])
+    if thought_text.strip():
+        thought_placeholder.markdown(
+            _thinking_html(thought_text, live=False, model=model_name),
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Reasoning is displayed for transparency and is never written to the ledger — "
+            "the ledger keeps only concise, audit-safe summaries."
+        )
+    else:
+        thought_placeholder.empty()
 
     st.subheader("Result")
     st.markdown(state.get("final_result") or "_no result_")

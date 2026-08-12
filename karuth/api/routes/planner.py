@@ -63,6 +63,7 @@ class PlannerGoalResponse(BaseModel):
     completed_steps: list[str]
     execution_history: list[dict]
     planner_thoughts: list[str]
+    thinking: list[str]
     notes: list[str]
     ledger_entries: int
     ledger_verified: bool
@@ -129,6 +130,7 @@ def planner_goal(request: PlannerGoalRequest) -> PlannerGoalResponse:
         completed_steps=list(state.get("completed_steps") or []),
         execution_history=list(state.get("execution_history") or []),
         planner_thoughts=list(state.get("planner_thoughts") or []),
+        thinking=list(getattr(planner, "last_thoughts", []) or []),
         notes=list(state.get("notes") or []),
         ledger_entries=len(ledger.list_entries(request.case_id)),
         ledger_verified=ledger.verify(),

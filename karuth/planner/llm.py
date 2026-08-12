@@ -27,6 +27,12 @@ Backends
 
 New providers subclass ``_BaseChatPlanner``, implement ``_complete``, and are
 registered in :func:`build_planner`.
+
+LLM backends stream completions and capture the model's reasoning tokens into
+``last_thoughts`` (forwarding them to a ``thoughts_callback`` when one is
+configured) so the UI can render the thinking live, xAI-style. Reasoning is
+**display-only** -- it is never written to the ledger, which keeps only
+concise, audit-safe explanations.
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Callable, Iterable
 from typing import Any, Protocol
 
 from karuth.config import (
@@ -510,6 +517,157 @@ def _parse_plan_json(raw: str, goal: str) -> InvestigationPlan:
     return InvestigationPlan.model_validate(payload)
 
 
+# ---------------------------------------------------------------------------
+# Streaming completion helpers (live "thinking" capture)
+# ---------------------------------------------------------------------------
+
+
+def _delta_reasoning(delta: Any) -> str:
+    """Extract reasoning text from a streamed delta chunk.
+
+    OpenAI-style models emit ``delta.reasoning``; DeepSeek/Qwen/OpenRouter
+    reasoning models emit ``delta.reasoning_content``. Returns ``""`` when the
+    chunk carries no reasoning, so plain models simply produce no thoughts.
+    """
+    for attr in ("reasoning_content", "reasoning"):
+        value = getattr(delta, attr, None)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _message_reasoning(message: Any) -> str:
+    """Extract reasoning text from a non-streamed message, if the model emits it."""
+    for attr in ("reasoning_content", "reasoning"):
+        value = getattr(message, attr, None)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _usage_dict(usage: Any) -> dict[str, int] | None:
+    if usage is None:
+        return None
+    captured = {
+        key: getattr(usage, key)
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+        if hasattr(usage, key)
+    }
+    return captured or None
+
+
+def _is_stream_response(response: Any) -> bool:
+    """True when ``create()`` returned a streamed (iterable) response."""
+    return isinstance(response, Iterable) and not isinstance(
+        response, (str, bytes, dict, list, tuple)
+    )
+
+
+def _finish_non_streaming_response(
+    response: Any,
+    *,
+    on_thought: Callable[[str], None] | None = None,
+) -> tuple[str, list[str], dict[str, int] | None]:
+    """Read (content, thoughts, usage) from a non-streamed response."""
+    try:
+        message = response.choices[0].message
+    except (AttributeError, IndexError, TypeError):
+        return "", [], None
+    content = message.content if isinstance(message.content, str) else json.dumps(message.content)
+    reasoning = _message_reasoning(message)
+    thoughts = [reasoning] if reasoning else []
+    if on_thought is not None and reasoning:
+        on_thought(reasoning)
+    return content, thoughts, _usage_dict(getattr(response, "usage", None))
+
+
+def _consume_stream(
+    response: Iterable[Any],
+    *,
+    on_thought: Callable[[str], None] | None = None,
+) -> tuple[str, list[str], dict[str, int] | None]:
+    """Fold a streamed response into (content, thoughts, usage).
+
+    Reasoning tokens are appended to ``thoughts`` and forwarded to
+    ``on_thought`` as they arrive, so the UI can render the model's thinking
+    live. Content tokens accumulate into the final completion text.
+    """
+    content: list[str] = []
+    thoughts: list[str] = []
+    usage: dict[str, int] | None = None
+    for chunk in response:
+        chunk_usage = getattr(chunk, "usage", None)
+        if chunk_usage is not None:
+            usage = _usage_dict(chunk_usage)
+        choices = getattr(chunk, "choices", None)
+        if not choices:
+            continue
+        delta = choices[0].delta
+        if delta is None:
+            continue
+        reasoning = _delta_reasoning(delta)
+        if reasoning:
+            thoughts.append(reasoning)
+            if on_thought is not None:
+                on_thought(reasoning)
+        part = getattr(delta, "content", None)
+        if isinstance(part, str) and part:
+            content.append(part)
+    return "".join(content), thoughts, usage
+
+
+def _stream_completion(
+    *,
+    client: Any,
+    model: str,
+    messages: list[dict[str, str]],
+    temperature: float,
+    max_tokens: int,
+    timeout: float,
+    extra_headers: dict[str, str] | None = None,
+    on_thought: Callable[[str], None] | None = None,
+) -> tuple[str, list[str], dict[str, int] | None]:
+    """Call ``chat.completions.create``, returning (content, thoughts, usage).
+
+    Requests ``stream=True`` so reasoning tokens can be surfaced live. Any
+    server or injected client that cannot stream falls back to a plain
+    non-streaming call, so existing fakes and older backends keep working;
+    a streamed response whose ``choices`` are missing is treated as a usage
+    tick. Raises only when both streaming and non-streaming fail.
+    """
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "timeout": timeout,
+        "stream": True,
+    }
+    if extra_headers:
+        kwargs["extra_headers"] = extra_headers
+
+    # Try progressively safer call modes: streaming with usage (modern servers),
+    # plain streaming (older servers), then non-streaming (no streaming support).
+    response = None
+    attempts = (
+        {**kwargs, "stream_options": {"include_usage": True}},
+        kwargs,
+        {key: value for key, value in kwargs.items() if key != "stream"},
+    )
+    for attempt in attempts:
+        try:
+            response = client.chat.completions.create(**attempt)
+            break
+        except Exception:
+            continue
+    if response is None:
+        raise RuntimeError("chat completion unavailable (all call modes failed)")
+
+    if _is_stream_response(response):
+        return _consume_stream(response, on_thought=on_thought)
+    return _finish_non_streaming_response(response, on_thought=on_thought)
+
+
 class _BaseChatPlanner:
     """Shared plumbing for chat-completion planner backends.
 
@@ -524,6 +682,35 @@ class _BaseChatPlanner:
         self._model = model or LMSTUDIO_MODEL
         self._temperature = temperature
         self.last_usage: dict[str, Any] | None = None
+        self.last_thoughts: list[str] = []  # reasoning tokens from the last call (display only)
+        self._thoughts_callback: Callable[[str], None] | None = None
+
+    def _resolve_model(self) -> str:
+        """Return the model to chat with; subclasses may auto-discover it."""
+        return self._model or ""
+
+    def _chat_complete(self, messages: list[dict[str, str]]) -> str:
+        """Stream a completion and capture reasoning tokens for the UI.
+
+        Returns the final completion text unchanged; reasoning tokens are
+        accumulated in ``self.last_thoughts`` and, when a ``thoughts_callback``
+        was configured, forwarded as they arrive so the UI can render the
+        model's thinking live (xAI-style). The reasoning is display-only and
+        is never written to the ledger.
+        """
+        content, thoughts, usage = _stream_completion(
+            client=self._get_client(),
+            model=self._resolve_model(),
+            messages=messages,
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+            timeout=self._timeout,
+            extra_headers=getattr(self, "_extra_headers", None),
+            on_thought=self._thoughts_callback,
+        )
+        self.last_usage = usage
+        self.last_thoughts = list(thoughts)
+        return content
 
     def generate_plan(self, goal: str, state_summary: dict[str, Any] | None = None) -> InvestigationPlan:
         return self._ask(goal, state_summary or {}, replan=False)
@@ -616,6 +803,7 @@ class LMStudioPlanner(_BaseChatPlanner):
         timeout: float | None = None,
         api_key: str = "lm-studio",
         client: Any = None,
+        thoughts_callback: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__(
             model=model or LMSTUDIO_MODEL,
@@ -627,6 +815,7 @@ class LMStudioPlanner(_BaseChatPlanner):
         self._api_key = api_key
         self._client = client  # injectable for tests; avoids importing openai
         self._resolved_model: str | None = None
+        self._thoughts_callback = thoughts_callback
 
     def _get_client(self) -> Any:
         if self._client is None:
@@ -654,23 +843,7 @@ class LMStudioPlanner(_BaseChatPlanner):
         return ""
 
     def _complete(self, messages: list[dict[str, str]]) -> str:
-        client = self._get_client()
-        response = client.chat.completions.create(
-            model=self._resolve_model(),
-            messages=messages,
-            temperature=self._temperature,
-            max_tokens=self._max_tokens,
-            timeout=self._timeout,
-        )
-        usage = getattr(response, "usage", None)
-        if usage is not None:
-            self.last_usage = {
-                key: getattr(usage, key)
-                for key in ("prompt_tokens", "completion_tokens", "total_tokens")
-                if hasattr(usage, key)
-            }
-        content = response.choices[0].message.content
-        return content if isinstance(content, str) else json.dumps(content)
+        return self._chat_complete(messages)
 
 
 class OpenRouterPlanner(_BaseChatPlanner):
@@ -696,6 +869,7 @@ class OpenRouterPlanner(_BaseChatPlanner):
         timeout: float | None = None,
         api_key: str | None = None,
         client: Any = None,
+        thoughts_callback: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__(
             model=model or OPENROUTER_MODEL,
@@ -706,6 +880,8 @@ class OpenRouterPlanner(_BaseChatPlanner):
         self._timeout = OPENROUTER_TIMEOUT if timeout is None else timeout
         self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self._client = client  # injectable for tests; avoids importing openai
+        self._thoughts_callback = thoughts_callback
+        self._extra_headers = {"HTTP-Referer": "https://karuth.local", "X-Title": "Karuth"}
 
     def _get_client(self) -> Any:
         if self._client is None:
@@ -724,24 +900,7 @@ class OpenRouterPlanner(_BaseChatPlanner):
         return self._client
 
     def _complete(self, messages: list[dict[str, str]]) -> str:
-        client = self._get_client()
-        response = client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            temperature=self._temperature,
-            max_tokens=self._max_tokens,
-            timeout=self._timeout,
-            extra_headers={"HTTP-Referer": "https://karuth.local", "X-Title": "Karuth"},
-        )
-        usage = getattr(response, "usage", None)
-        if usage is not None:
-            self.last_usage = {
-                key: getattr(usage, key)
-                for key in ("prompt_tokens", "completion_tokens", "total_tokens")
-                if hasattr(usage, key)
-            }
-        content = response.choices[0].message.content
-        return content if isinstance(content, str) else json.dumps(content)
+        return self._chat_complete(messages)
 
 
 class FallbackPlanner:
@@ -775,6 +934,11 @@ class FallbackPlanner:
     @property
     def last_usage(self) -> dict[str, Any] | None:
         return getattr(self._primary, "last_usage", None)
+
+    @property
+    def last_thoughts(self) -> list[str]:
+        """Reasoning tokens captured from the primary LLM backend (display only)."""
+        return list(getattr(self._primary, "last_thoughts", []) or [])
 
     def generate_plan(self, goal: str, state_summary: dict[str, Any] | None = None) -> InvestigationPlan:
         try:
@@ -818,6 +982,11 @@ def build_planner(backend: str = "openrouter", *, fallback: bool = True, **kwarg
 
     ``backend`` may be ``"openrouter"`` (default), ``"lmstudio"`` (offline
     LLM), or ``"deterministic"``.
+
+    Extra ``kwargs`` (e.g. ``model``, ``base_url``, ``thoughts_callback``) are
+    passed through to the backend constructor. ``thoughts_callback`` receives
+    reasoning tokens as they stream in, letting a UI render the model's
+    thinking live; the tokens are also captured on ``last_thoughts``.
     """
     if backend == "deterministic":
         return DeterministicPlanner()

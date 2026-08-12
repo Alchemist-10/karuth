@@ -699,3 +699,120 @@ def test_tool_registry_metadata_is_complete():
     text = tool_metadata_text()
     for name in TOOL_REGISTRY:
         assert name in text
+
+
+# ---------------------------------------------------------------------------
+# streaming reasoning capture (xAI-style thinking)
+# ---------------------------------------------------------------------------
+
+
+class _FakeStreamCompletions:
+    """Yields streamed chunks; supports reasoning_content / reasoning deltas."""
+
+    def __init__(self, chunks: list):
+        self._chunks = chunks
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return iter(self._chunks)
+
+
+class _FakeStreamClient:
+    def __init__(self, chunks: list):
+        self.chat = types.SimpleNamespace(completions=_FakeStreamCompletions(chunks))
+
+
+def _stream_chunk(delta: dict | None = None, usage=None):
+    if delta is None:
+        choices: list = []
+    else:
+        choices = [types.SimpleNamespace(delta=types.SimpleNamespace(**delta))]
+    return types.SimpleNamespace(choices=choices, usage=usage)
+
+
+def test_llm_backend_streams_reasoning_tokens_to_callback():
+    payload = _plan_json("Find links", ["ExtractionAgent", "CorrelationAgent", "ReportAgent"])
+    chunks = [
+        _stream_chunk({"reasoning_content": "The plate appears in chat evidence. "}),
+        _stream_chunk({"reasoning_content": "Scheduling extraction first."}),
+        _stream_chunk({"content": payload}),
+        _stream_chunk(usage=types.SimpleNamespace(prompt_tokens=12, completion_tokens=34, total_tokens=46)),
+    ]
+    seen: list[str] = []
+    planner = LMStudioPlanner(client=_FakeStreamClient(chunks), thoughts_callback=seen.append)
+    plan = planner.generate_plan("Find links", {"case_id": "CASE-1"})
+    assert "".join(seen) == "The plate appears in chat evidence. Scheduling extraction first."
+    assert "".join(planner.last_thoughts) == (
+        "The plate appears in chat evidence. Scheduling extraction first."
+    )
+    assert [task.tool for task in plan.tasks][:2] == ["ExtractionAgent", "CorrelationAgent"]
+    assert planner.last_usage == {
+        "prompt_tokens": 12,
+        "completion_tokens": 34,
+        "total_tokens": 46,
+    }
+    assert planner._get_client().chat.completions.calls[0]["stream"] is True
+
+
+def test_openrouter_reasoning_variant_captures_thinking():
+    # OpenAI-style models emit delta.reasoning (not reasoning_content).
+    payload = _plan_json("Triage leads", ["ExtractionAgent", "TriageAgent", "ReportAgent"])
+    chunks = [
+        _stream_chunk({"reasoning": "Triage needs extracted entities first."}),
+        _stream_chunk({"content": payload}),
+    ]
+    planner = OpenRouterPlanner(client=_FakeStreamClient(chunks), api_key="test-key")
+    plan = planner.generate_plan("Triage leads", {})
+    assert "".join(planner.last_thoughts) == "Triage needs extracted entities first."
+    assert plan.tasks
+
+
+def test_non_reasoning_model_streams_content_without_thoughts():
+    payload = _plan_json("Summarize", ["ExtractionAgent", "ReportAgent"])
+    chunks = [
+        _stream_chunk({"content": "Here is the plan: "}),
+        _stream_chunk({"content": payload}),
+    ]
+    seen: list[str] = []
+    planner = LMStudioPlanner(client=_FakeStreamClient(chunks), thoughts_callback=seen.append)
+    plan = planner.generate_plan("Summarize", {})
+    assert seen == []
+    assert planner.last_thoughts == []
+    assert plan.tasks
+
+
+class _NoStreamCompletions:
+    """A backend that rejects streaming entirely (older LM Studio)."""
+
+    def __init__(self, content: str):
+        self._content = content
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs.get("stream"):
+            raise RuntimeError("streaming not supported")
+        message = types.SimpleNamespace(content=self._content)
+        choice = types.SimpleNamespace(message=message)
+        usage = types.SimpleNamespace(prompt_tokens=4, completion_tokens=5, total_tokens=9)
+        return types.SimpleNamespace(choices=[choice], usage=usage)
+
+
+class _NoStreamClient:
+    def __init__(self, content: str):
+        self.chat = types.SimpleNamespace(completions=_NoStreamCompletions(content))
+
+
+def test_streaming_failure_retries_non_streaming_without_falling_back():
+    payload = _plan_json("Find links", ["ExtractionAgent", "ReportAgent"])
+    planner = FallbackPlanner(LMStudioPlanner(client=_NoStreamClient(payload)))
+    plan = planner.generate_plan("Find links", {"case_id": "CASE-1"})
+    assert planner.last_backend == "lmstudio"  # LLM backend still produced the plan
+    assert [task.tool for task in plan.tasks][0] == "ExtractionAgent"
+    assert planner.last_thoughts == []
+    assert planner.last_usage == {
+        "prompt_tokens": 4,
+        "completion_tokens": 5,
+        "total_tokens": 9,
+    }
