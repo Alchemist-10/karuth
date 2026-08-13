@@ -679,12 +679,17 @@ def test_guardrails_block_llm_external_url_in_plan(tmp_path):
 def test_tool_registry_metadata_is_complete():
     assert set(TOOL_REGISTRY) == {
         "ExtractionAgent",
+        "ObservationAgent",
         "CorrelationAgent",
         "TimelineAgent",
         "TriageAgent",
         "ReportAgent",
         "LegalActionAgent",
         "VisionAgent",
+        "HypothesisAgent",
+        "ContradictionHunter",
+        "SkepticReview",
+        "MvdRegistryLookup",
     }
     for name, spec in TOOL_REGISTRY.items():
         assert spec.description
@@ -693,9 +698,14 @@ def test_tool_registry_metadata_is_complete():
         # VisionAgent is the only LLM-dependent tool (needs LM Studio vision).
         assert spec.offline is (name != "VisionAgent")
     assert PRODUCER_BY_OUTPUT["entities"] == "ExtractionAgent"
+    assert PRODUCER_BY_OUTPUT["image_observations"] == "ObservationAgent"
     assert PRODUCER_BY_OUTPUT["matches"] == "CorrelationAgent"
     assert PRODUCER_BY_OUTPUT["report"] == "ReportAgent"
     assert PRODUCER_BY_OUTPUT["image_transcriptions"] == "VisionAgent"
+    assert PRODUCER_BY_OUTPUT["hypotheses"] == "HypothesisAgent"
+    assert PRODUCER_BY_OUTPUT["contradictions"] == "ContradictionHunter"
+    assert PRODUCER_BY_OUTPUT["skeptic_review"] == "SkepticReview"
+    assert PRODUCER_BY_OUTPUT["registry_results"] == "MvdRegistryLookup"
     text = tool_metadata_text()
     for name in TOOL_REGISTRY:
         assert name in text

@@ -16,12 +16,17 @@ from pydantic import BaseModel, Field
 
 ToolName = Literal[
     "ExtractionAgent",
+    "ObservationAgent",
     "CorrelationAgent",
     "TimelineAgent",
     "TriageAgent",
     "ReportAgent",
     "LegalActionAgent",
     "VisionAgent",
+    "HypothesisAgent",
+    "ContradictionHunter",
+    "SkepticReview",
+    "MvdRegistryLookup",
 ]
 
 CostLevel = Literal["low", "medium", "high"]
@@ -82,6 +87,40 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         offline=True,
         risk="LOW",
         review_required=False,
+    ),
+    "ObservationAgent": ToolSpec(
+        name="ObservationAgent",
+        description=(
+            "Deterministically inspects the case images and records structured "
+            "multimodal observations (person, vehicle, number plate, GPS "
+            "location, timestamp, camera serial, visible objects, sensitive "
+            "content, activity interpretation). Must run after extraction and "
+            "before correlation so the investigator sees what the images "
+            "contribute before links are drawn."
+        ),
+        capabilities=[
+            "structured image observations from embedded EXIF + sidecars",
+            "number-plate readings with OCR alternatives",
+            "sensitive-content detection and blurred-preview gating",
+            "activity interpretations labeled as LLM visual interpretation",
+        ],
+        limitations=[
+            "observations are metadata/synthetic driven; a real vision model is optional",
+            "identity observations are candidate associations, never confirmed identity",
+        ],
+        required_inputs=[],
+        produced_outputs=[
+            ToolOutput(
+                key="image_observations",
+                label="multimodal observations",
+                description="structured per-image observations",
+            )
+        ],
+        supported_evidence=["images"],
+        cost="low",
+        offline=True,
+        risk="LOW",
+        review_required=True,
     ),
     "CorrelationAgent": ToolSpec(
         name="CorrelationAgent",
@@ -215,6 +254,102 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         offline=True,
         risk="LOW",
         review_required=False,
+    ),
+    "HypothesisAgent": ToolSpec(
+        name="HypothesisAgent",
+        description=(
+            "Deterministically proposes competing hypotheses from extracted "
+            "entities and matches (who is connected to what, and why). Every "
+            "hypothesis references real evidence ids; the LLM never marks one "
+            "supported or rejected."
+        ),
+        capabilities=["competing hypothesis generation", "evidence-linked proposals"],
+        limitations=["proposes only what the evidence supports; no speculation"],
+        required_inputs=["entities"],
+        produced_outputs=[
+            ToolOutput(key="hypotheses", label="investigative hypotheses", description="structured hypothesis list")
+        ],
+        supported_evidence=[],
+        cost="low",
+        offline=True,
+        risk="LOW",
+        review_required=True,
+    ),
+    "ContradictionHunter": ToolSpec(
+        name="ContradictionHunter",
+        description=(
+            "Deterministically hunts for conflicts in the extracted facts: "
+            "impossible movement timelines, inconsistent identities on shared "
+            "identifiers, and conflicting timestamps. Every contradiction cites "
+            "the artifacts behind it."
+        ),
+        capabilities=[
+            "impossible-movement detection",
+            "inconsistent-identity detection (vehicle / camera)",
+            "artifact-linked evidence citations",
+        ],
+        limitations=["finds only rule-defined conflicts; never invents contradictions"],
+        required_inputs=["entities", "matches"],
+        produced_outputs=[
+            ToolOutput(key="contradictions", label="contradictions", description="deterministic conflict list")
+        ],
+        supported_evidence=[],
+        cost="low",
+        offline=True,
+        risk="LOW",
+        review_required=True,
+    ),
+    "SkepticReview": ToolSpec(
+        name="SkepticReview",
+        description=(
+            "Adversarially reviews the main conclusion before finalization: "
+            "tries to disprove it, lowers confidence when contradictions remain, "
+            "names the strongest alternative explanation, and lists the evidence "
+            "still needed."
+        ),
+        capabilities=["alternative explanations", "confidence adjustment", "missing-evidence gaps"],
+        limitations=["deterministic core; LLM never confirms or rejects conclusions"],
+        required_inputs=["hypotheses"],
+        produced_outputs=[
+            ToolOutput(key="skeptic_review", label="skeptic review", description="adversarial conclusion review")
+        ],
+        supported_evidence=[],
+        cost="low",
+        offline=True,
+        risk="LOW",
+        review_required=True,
+    ),
+    "MvdRegistryLookup": ToolSpec(
+        name="MvdRegistryLookup",
+        description=(
+            "Approval-gated lookup of a vehicle registry (RC record) for a plate: "
+            "returns the registered owner, address, and vehicle details from a "
+            "clearly synthetic mock MVD registry. Registered ownership does not "
+            "prove who operated the vehicle; results are fixture data only and "
+            "require investigator approval before the tool may run."
+        ),
+        capabilities=[
+            "mock MVD RC owner lookup by plate",
+            "registered-owner metadata facts with synthetic provenance",
+        ],
+        limitations=[
+            "mock fixture data only - never use for real casework",
+            "registered owner is not proof of who operated the vehicle",
+            "requires investigator approval (registry_lookup_approved) before it may run",
+        ],
+        required_inputs=[],
+        produced_outputs=[
+            ToolOutput(
+                key="registry_results",
+                label="registry lookup results",
+                description="mock MVD RC records (synthetic fixtures)",
+            )
+        ],
+        supported_evidence=[],
+        cost="low",
+        offline=True,
+        risk="LOW",
+        review_required=True,
     ),
 }
 

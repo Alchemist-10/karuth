@@ -15,6 +15,15 @@ from karuth.ledger import LedgerEntry, LedgerEntryCreate, LedgerStore
 from karuth.planner.schema import InvestigationPlan
 
 
+# Entry types used by the dynamic hypothesis loop. Keeping them under
+# ``agent_action`` (like the rest of the planner) preserves the ledger schema.
+_HYPOTHESIS_ENTRY = "agent_action"
+_ACTION_ENTRY = "agent_action"
+_OBSERVATION_ENTRY = "agent_action"
+_CONTRADICTION_ENTRY = "agent_action"
+_SKEPTIC_ENTRY = "agent_action"
+
+
 class PlannerAuditor:
     def __init__(self, ledger: LedgerStore, case_id: str, actor: str = "planner") -> None:
         self._ledger = ledger
@@ -120,6 +129,71 @@ class PlannerAuditor:
             "agent_action", "chain_verified", "ledger", {"ok": ok}
         )
 
+    # ---- dynamic hypothesis loop -----------------------------------------
+    def hypothesis_created(self, summary: dict) -> LedgerEntry:
+        return self._append(
+            _HYPOTHESIS_ENTRY,
+            "hypothesis_created",
+            "hypothesis",
+            summary,
+        )
+
+    def hypothesis_transitioned(self, hypothesis_id: str, old: str, new: str) -> LedgerEntry:
+        return self._append(
+            _HYPOTHESIS_ENTRY,
+            "hypothesis_transitioned",
+            "hypothesis",
+            {"hypothesis_id": hypothesis_id, "from": old, "to": new},
+        )
+
+    def action_decided(self, decision: dict) -> LedgerEntry:
+        return self._append(
+            _ACTION_ENTRY,
+            "action_decided",
+            "action",
+            decision,
+        )
+
+    def observation_recorded(self, observation: dict) -> LedgerEntry:
+        return self._append(
+            _OBSERVATION_ENTRY,
+            "observation_recorded",
+            "observation",
+            observation,
+        )
+
+    def contradiction_found(self, contradiction: dict) -> LedgerEntry:
+        return self._append(
+            _CONTRADICTION_ENTRY,
+            "contradiction_found",
+            "contradiction",
+            contradiction,
+        )
+
+    def skeptic_reviewed(self, review: dict) -> LedgerEntry:
+        return self._append(
+            _SKEPTIC_ENTRY,
+            "skeptic_reviewed",
+            "skeptic_review",
+            review,
+        )
+
+    def dynamic_finalized(self, summary: dict) -> LedgerEntry:
+        return self._append(
+            _ACTION_ENTRY,
+            "dynamic_finalized",
+            "plan",
+            summary,
+        )
+
+    def human_input_requested(self, note: str) -> LedgerEntry:
+        return self._append(
+            _ACTION_ENTRY,
+            "human_input_requested",
+            "checkpoint",
+            {"note": note},
+        )
+
     def planner_finished(self, summary: dict[str, Any]) -> LedgerEntry:
         return self._append(
             "agent_action", "planner_finished", "plan", summary
@@ -154,6 +228,29 @@ class PlannerAuditor:
     def authorization_granted(self, target: str) -> LedgerEntry:
         return self._append(
             "review_action", "authorization_granted", target, {"granted": True}
+        )
+
+    # ---- external registry lookups ---------------------------------------
+    def registry_lookup_approved(self, lookup_kind: str) -> LedgerEntry:
+        return self._append(
+            "review_action",
+            "registry_lookup_approved",
+            lookup_kind,
+            {"approved": True, "mode": "synthetic_mock"},
+        )
+
+    def registry_lookup_result(self, result: dict) -> LedgerEntry:
+        return self._append(
+            "agent_action",
+            "registry_lookup_result",
+            "external_lookup",
+            {
+                "lookup_kind": result.get("lookup_kind"),
+                "key": result.get("key"),
+                "source_system": result.get("source_system"),
+                "retrieved_at": result.get("retrieved_at"),
+                "findings": len(result.get("findings", [])),
+            },
         )
 
     # ---- export -----------------------------------------------------------

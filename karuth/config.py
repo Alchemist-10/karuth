@@ -46,7 +46,9 @@ LMSTUDIO_BASE_URL = os.environ.get("KARUTH_LMSTUDIO_BASE_URL", "http://localhost
 LMSTUDIO_MODEL = os.environ.get("KARUTH_LMSTUDIO_MODEL", "")
 LMSTUDIO_TEMPERATURE = float(os.environ.get("KARUTH_LMSTUDIO_TEMPERATURE", "0.0"))
 LMSTUDIO_MAX_TOKENS = int(os.environ.get("KARUTH_LMSTUDIO_MAX_TOKENS", "1024"))
-LMSTUDIO_TIMEOUT = float(os.environ.get("KARUTH_LMSTUDIO_TIMEOUT", "60.0"))
+# Keep timeouts short: an unreachable LLM endpoint must fail fast so the
+# planner falls back to deterministic mode in seconds, not minutes.
+LMSTUDIO_TIMEOUT = float(os.environ.get("KARUTH_LMSTUDIO_TIMEOUT", "20.0"))
 
 # OpenRouter backend (OpenAI-compatible REST endpoint). Opt-in only: LM Studio
 # remains the offline default. The API key is read from the OPENROUTER_API_KEY
@@ -55,11 +57,22 @@ OPENROUTER_BASE_URL = os.environ.get("KARUTH_OPENROUTER_BASE_URL", "https://open
 OPENROUTER_MODEL = os.environ.get("KARUTH_OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
 OPENROUTER_TEMPERATURE = float(os.environ.get("KARUTH_OPENROUTER_TEMPERATURE", "0.0"))
 OPENROUTER_MAX_TOKENS = int(os.environ.get("KARUTH_OPENROUTER_MAX_TOKENS", "2048"))
-OPENROUTER_TIMEOUT = float(os.environ.get("KARUTH_OPENROUTER_TIMEOUT", "120.0"))
+OPENROUTER_TIMEOUT = float(os.environ.get("KARUTH_OPENROUTER_TIMEOUT", "20.0"))
 
 # Planner graph loop safety net: how many single-task iterations may run
 # before the planner is forced to finalize.
 PLANNER_MAX_ITERATIONS = 30
+
+# Dynamic hypothesis-driven loop (agentic mode) tuning. Every value is
+# env-overridable (KARUTH_*). These bound the autonomous loop so it can never
+# spin forever and keep decisions conservative and reviewable.
+DYNAMIC_MAX_ACTIONS = int(os.environ.get("KARUTH_DYNAMIC_MAX_ACTIONS", "12"))
+MAX_HYPOTHESES = int(os.environ.get("KARUTH_MAX_HYPOTHESES", "8"))
+SKEPTIC_CONFIDENCE_THRESHOLD = float(
+    os.environ.get("KARUTH_SKEPTIC_CONFIDENCE_THRESHOLD", "0.8")
+)
+INFO_GAIN_THRESHOLD = float(os.environ.get("KARUTH_INFO_GAIN_THRESHOLD", "0.25"))
+HUMAN_REVIEW_THRESHOLD = float(os.environ.get("KARUTH_HUMAN_REVIEW_THRESHOLD", "0.7"))
 # Real face recognition (OpenCV Zoo models, downloaded on first use into the
 # model cache). YuNet detects faces; SFace produces 128-d recognition
 # embeddings. Override the cache dir with KARUTH_MODEL_DIR.

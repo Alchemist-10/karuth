@@ -15,8 +15,14 @@ from typing import TypedDict
 
 from karuth.correlation.candidate_matcher import CorrelationResult
 from karuth.entities.schema import Entity
+from karuth.planner.actions import ActionDecision
+from karuth.planner.contradictions import Contradiction
 from karuth.planner.evidence import EvidenceItem
+from karuth.planner.hypothesis import Hypothesis
+from karuth.planner.investigation import InvestigationTree
+from karuth.planner.observer import Observation
 from karuth.planner.schema import InvestigationPlan, PlannerTask
+from karuth.planner.tool_result import ToolResult
 
 
 class PlannerState(TypedDict, total=False):
@@ -61,6 +67,34 @@ class PlannerState(TypedDict, total=False):
     model_used: str
     timing: dict
 
+    # ---- dynamic hypothesis loop (agentic mode) ---------------------------
+    mode: str
+    hypotheses: list[Hypothesis]
+    contradictions: list[Contradiction]
+    observations: list[Observation]
+    skeptic_review: dict
+    current_action: ActionDecision
+    current_result: ToolResult
+    actions_taken: list[ActionDecision]
+    tool_results: list[ToolResult]
+    investigation_tree: InvestigationTree
+    human_input_requested: bool
+    stop_reason: str
+    information_gain: float
+
+    # ---- multimodal + safety (Jesse demo) ---------------------------------
+    image_observations: list  # ImageObservation models
+    sensitive_content_detected: bool
+    identity_confirmed: bool  # investigator confirmation (UI checkbox)
+    activity_reviewed: bool  # investigator reviewed the LLM interpretation
+    rerank_pending: bool  # skeptic changed confidence -> re-rank leads
+    post_skeptic_rank: bool  # TriageAgent already re-ranked after the skeptic
+    confidence_breakdown: dict  # separate confidence values (None = Not scored)
+    confidence_history: list[dict]  # breakdown snapshots per observation step
+    # ---- external registry lookups (approval-gated, mock) ------------------
+    registry_lookup_approved: bool  # investigator pre-approved the mock MVD lookup
+    registry_results: list  # ExternalLookupResult dicts (synthetic fixtures)
+
 
 def initial_state(
     case_id: str,
@@ -68,6 +102,7 @@ def initial_state(
     goal: str,
     *,
     reveal_authorized: bool = False,
+    registry_lookup_approved: bool = False,
 ) -> PlannerState:
     """Build the starting planner state for a graph run."""
     return {
@@ -97,4 +132,25 @@ def initial_state(
         "token_usage": {},
         "model_used": "none",
         "timing": {},
+        "mode": "plan",
+        "hypotheses": [],
+        "contradictions": [],
+        "observations": [],
+        "skeptic_review": None,
+        "actions_taken": [],
+        "tool_results": [],
+        "investigation_tree": InvestigationTree(goal=goal),
+        "human_input_requested": False,
+        "stop_reason": "",
+        "information_gain": 0.0,
+        "image_observations": [],
+        "sensitive_content_detected": False,
+        "identity_confirmed": False,
+        "activity_reviewed": False,
+        "rerank_pending": False,
+        "post_skeptic_rank": False,
+        "confidence_breakdown": {},
+        "confidence_history": [],
+        "registry_lookup_approved": registry_lookup_approved,
+        "registry_results": [],
     }

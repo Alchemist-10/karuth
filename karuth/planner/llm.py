@@ -55,6 +55,7 @@ from karuth.config import (
     OPENROUTER_TEMPERATURE,
     OPENROUTER_TIMEOUT,
 )
+from karuth.planner.actions import ActionDecision, DeterministicActionPlanner
 from karuth.planner.evidence import EvidenceItem, evidence_summary
 from karuth.planner.schema import InvestigationPlan, PlannerTask, SafetyPolicy
 from karuth.planner.tools import TOOL_REGISTRY, tool_metadata_text
@@ -159,6 +160,14 @@ class PlannerLLM(Protocol):
         previous_plan: InvestigationPlan | None = None,
     ) -> InvestigationPlan:
         """Produce a revised plan when the first pass is insufficient."""
+
+    def decide_action(self, goal: str, context: dict[str, Any]) -> ActionDecision:
+        """Pick the single next action in the dynamic loop (optional).
+
+        Backends that do not implement dynamic decisions (e.g. minimal test
+        stubs) may omit this; the graph falls back to the deterministic
+        policy via :class:`~karuth.planner.actions.DeterministicActionPlanner`.
+        """
 
 
 def _legal_inputs(goal: str) -> tuple[str, list[str], dict[str, Any]]:
@@ -308,6 +317,10 @@ class DeterministicPlanner:
             dual_authorization_required=dual,
             confidence=confidence,
         )
+
+    def decide_action(self, goal: str, context: dict[str, Any]) -> ActionDecision:
+        """Offline rule-based next-action selection (always available)."""
+        return DeterministicActionPlanner().decide_action(goal, context)
 
     def replan(
         self,
@@ -518,6 +531,98 @@ def _parse_plan_json(raw: str, goal: str) -> InvestigationPlan:
 
 
 # ---------------------------------------------------------------------------
+# Dynamic action selection (one next action after each tool execution)
+# ---------------------------------------------------------------------------
+
+_ACTION_SYSTEM_PROMPT_TEMPLATE = """\
+You are the dynamic action-selection backend for Karuth, an offline, \
+case-scoped investigation system. After every tool execution you choose \
+exactly ONE next action from the current investigation context. You never \
+invent evidence, never create correlation matches, never modify extracted \
+entities, never fabricate results, and never bypass guardrails or review \
+authorization. You only decide *what to do next*.
+
+AVAILABLE DETERMINISTIC TOOLS (all run locally; you only schedule them):
+{tools}
+
+CURRENT INVESTIGATION CONTEXT (JSON):
+{context}
+
+RULES (investigator-safe order — you may not violate these):
+- The safe order is: extract evidence -> inspect multimodal observations \
+(ObservationAgent when images exist) -> correlate entities -> build timeline \
+-> generate competing hypotheses -> hunt contradictions -> challenge a \
+specific hypothesis (SkepticReview) -> re-rank the strongest leads \
+(TriageAgent) -> ask for human confirmation when required -> finalize.
+- NEVER select ReportAgent. The final evidence-linked report is generated \
+only by the finalize step, after contradiction and skeptic review.
+- ``run_tool`` executes a deterministic tool listed above whose required \
+state inputs already exist (ExtractionAgent needs no inputs; ObservationAgent \
+needs images; CorrelationAgent needs extracted entities; TimelineAgent needs \
+entities; ContradictionHunter needs entities and matches; SkepticReview needs \
+hypotheses; TriageAgent needs matches).
+- ``generate_hypothesis`` proposes competing hypotheses; never fabricate \
+evidence references (``proposed_hypothesis.evidence_refs`` must be real ids \
+from the context).
+- ``investigate_hypothesis`` runs a tool against ``target_hypothesis_id``.
+- ``challenge_hypothesis`` runs the skeptic (SkepticReview) to try to \
+disprove ``target_hypothesis_id``; it must always target a real hypothesis id \
+and must only be chosen after ContradictionHunter has run when contradictions \
+exist.
+- After a skeptic review that changes confidence, re-run TriageAgent to \
+re-rank the strongest leads before finalizing.
+- ``MvdRegistryLookup`` is approval-gated: schedule it only when the context \
+shows ``registry_lookup_approved=true``; otherwise never select it (the \
+router will refuse). It returns synthetic fixture data from a mock registry \
+and registered ownership never proves who operated the vehicle.
+- ``ask_human`` requests investigator input when contradictions are \
+unresolved at CRITICAL risk, or when review authorization is required.
+- ``finalize`` stops; set ``stop_reason`` to one of: sufficient_evidence, \
+unresolved_contradictions, unresolved_uncertainty, awaiting_human_confirmation, \
+activity_interpretation_requires_review, sensitive_content_gated, \
+action_budget_exhausted, no_information_gain. Never emit \
+sufficient_evidence while unresolved contradictions, an unconfirmed identity, \
+or an unreviewed activity interpretation remain.
+- Prefer tools that add information; never rerun a completed tool that would \
+produce no new facts. Set ``expected_information_gain`` accordingly (0.0-1.0).
+- ``rationale`` must be audit-safe and concise (never chain-of-thought).
+- Never propose external URLs or anything outside the case folder.
+
+Return ONLY a JSON object matching this schema (no prose, no markdown fences):
+{{
+  "action_type": "run_tool" | "investigate_hypothesis" | "generate_hypothesis" | \
+"challenge_hypothesis" | "ask_human" | "finalize",
+  "tool": "<tool name or empty>",
+  "arguments": {{}},
+  "target_hypothesis_id": "<id or empty>",
+  "rationale": "<audit-safe one-line rationale>",
+  "expected_information_gain": <0.0 to 1.0>,
+  "confidence": <0.0 to 1.0>,
+  "stop_reason": "<when finalize>",
+  "requires_human_review": <bool>
+}}"""
+
+
+def _build_action_messages(goal: str, context: dict[str, Any]) -> list[dict[str, str]]:
+    system = _ACTION_SYSTEM_PROMPT_TEMPLATE.format(
+        tools=tool_metadata_text(),
+        context=json.dumps(_json_safe(context), sort_keys=True, default=str),
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"Investigator goal: {goal}\nChoose the single next action."},
+    ]
+
+
+def _parse_action_json(raw: str, goal: str) -> ActionDecision:
+    """Strictly validate an LLM action decision into an ActionDecision."""
+    payload = json.loads(_extract_json(raw))
+    if not isinstance(payload, dict):
+        raise ValueError("LLM action JSON is not an object")
+    return ActionDecision.model_validate(payload)
+
+
+# ---------------------------------------------------------------------------
 # Streaming completion helpers (live "thinking" capture)
 # ---------------------------------------------------------------------------
 
@@ -725,6 +830,12 @@ class _BaseChatPlanner:
 
     def is_available(self) -> bool:
         return True
+
+    def decide_action(self, goal: str, context: dict[str, Any]) -> ActionDecision:
+        """Ask the LLM for the single next dynamic action (strict JSON)."""
+        messages = _build_action_messages(goal, context)
+        raw = self._complete(messages)
+        return _parse_action_json(raw, goal)
 
     def _ask(
         self,
@@ -964,6 +1075,17 @@ class FallbackPlanner:
             self.last_error = str(exc)
             self.last_backend = getattr(self._fallback, "backend_name", "deterministic")
             return self._fallback.replan(goal, state_summary, previous_plan)
+
+    def decide_action(self, goal: str, context: dict[str, Any]) -> ActionDecision:
+        """Pick the next action, falling back to the deterministic policy."""
+        try:
+            decision = self._primary.decide_action(goal, context)
+            self.last_backend = getattr(self._primary, "backend_name", "primary")
+            return decision
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.last_backend = getattr(self._fallback, "backend_name", "deterministic")
+            return self._fallback.decide_action(goal, context)
 
     def is_available(self) -> bool:
         return True

@@ -12,7 +12,15 @@ from __future__ import annotations
 
 from langgraph.graph import END, StateGraph
 
+from karuth.config import DYNAMIC_MAX_ACTIONS
 from karuth.planner.audit import PlannerAuditor
+from karuth.planner.dynamic import (
+    dynamic_decide_step,
+    dynamic_execute_step,
+    dynamic_finalize_step,
+    dynamic_human_step,
+    dynamic_observe_step,
+)
 from karuth.planner.llm import PlannerLLM
 from karuth.planner.nodes import (
     check_step,
@@ -84,6 +92,43 @@ def build_planner_graph(
         lambda state: "select" if state.get("pending_steps") else "finalize",
         {"select": "select", "finalize": "finalize"},
     )
+    graph.add_edge("finalize", END)
+
+    return graph.compile()
+
+
+def build_dynamic_planner_graph(
+    planner: PlannerLLM,
+    auditor: PlannerAuditor,
+    *,
+    max_actions: int = DYNAMIC_MAX_ACTIONS,
+    max_iterations: int = 60,
+):
+    """Compile the dynamic hypothesis-driven loop graph.
+
+    Flow: plan (scaffold only) -> decide -> execute -> observe -> decide ...
+    until ``ask_human`` or ``finalize``. The classic graph above stays
+    available; this one drives ``mode="dynamic"`` runs.
+    """
+    graph = StateGraph(PlannerState)
+
+    graph.add_node("plan", lambda state: plan_step(state, planner, auditor))
+    graph.add_node("decide", lambda state: dynamic_decide_step(state, planner, auditor, max_actions=max_actions))
+    graph.add_node("execute", lambda state: dynamic_execute_step(state, auditor))
+    graph.add_node("observe", lambda state: dynamic_observe_step(state, auditor))
+    graph.add_node("human", lambda state: dynamic_human_step(state, auditor))
+    graph.add_node("finalize", lambda state: dynamic_finalize_step(state, auditor))
+
+    graph.set_entry_point("plan")
+    graph.add_edge("plan", "decide")
+    graph.add_conditional_edges(
+        "decide",
+        lambda state: state.get("next_dynamic", "finalize"),
+        {"execute": "execute", "human": "human", "finalize": "finalize"},
+    )
+    graph.add_edge("execute", "observe")
+    graph.add_edge("observe", "decide")
+    graph.add_edge("human", "finalize")
     graph.add_edge("finalize", END)
 
     return graph.compile()

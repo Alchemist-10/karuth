@@ -9,7 +9,17 @@ from typing import Any, Iterable
 from karuth.entities.schema import Entity
 
 PHONE_RE = re.compile(r"\+?\d{10,15}")
-PLATE_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Z]{1,2}\d{4}\b")
+# Compact (KL01CC2121 / KL01cc2121) and hyphenated (NM-JP-4242) plates.
+PLATE_RE = re.compile(
+    r"\b[A-Z]{2}\s?\d{1,2}\s?[A-Z]{1,3}\s?\d{3,4}\b"
+    r"|\b[A-Z]{2}[- ][A-Z]{2}[- ]?\d{3,4}\b",
+    re.IGNORECASE,
+)
+
+
+def normalize_plate(value: object) -> str:
+    """Uppercase and strip whitespace (keep hyphens) for plate comparison."""
+    return re.sub(r"\s+", "", str(value or "")).upper()
 
 
 def entity_id(*parts: object) -> str:
@@ -78,9 +88,27 @@ def normalize_chat_carve(carve: dict[str, Any]) -> list[Entity]:
     return entities
 
 
+def _metadata_trail(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Carry EXIF provenance + confidence onto every derived entity so the
+    contradiction hunter can detect embedded-vs-sidecar metadata conflicts."""
+    trail: dict[str, Any] = {}
+    if metadata.get("provenance"):
+        trail["exif_provenance"] = metadata["provenance"]
+    if metadata.get("metadata_confidence") is not None:
+        trail["metadata_confidence"] = metadata["metadata_confidence"]
+    if metadata.get("source_hash"):
+        trail["source_hash"] = metadata["source_hash"]
+    if metadata.get("plate_alternatives"):
+        trail["plate_alternatives"] = metadata["plate_alternatives"]
+    if metadata.get("plate_confidence") is not None:
+        trail["plate_confidence"] = metadata["plate_confidence"]
+    return trail
+
+
 def normalize_image_metadata(metadata: dict[str, Any]) -> list[Entity]:
     source_file = str(metadata["source_file"])
     entities: list[Entity] = []
+    trail = _metadata_trail(metadata)
     if "camera_serial" in metadata:
         entities.append(
             Entity(
@@ -89,7 +117,7 @@ def normalize_image_metadata(metadata: dict[str, Any]) -> list[Entity]:
                 value=metadata["camera_serial"],
                 source_file=source_file,
                 confidence=1.0,
-                metadata={"captured_at": metadata.get("captured_at")},
+                metadata={"captured_at": metadata.get("captured_at"), **trail},
             )
         )
     if "vehicle_plate" in metadata:
@@ -100,7 +128,7 @@ def normalize_image_metadata(metadata: dict[str, Any]) -> list[Entity]:
                 value=metadata["vehicle_plate"],
                 source_file=source_file,
                 confidence=0.93,
-                metadata={"captured_at": metadata.get("captured_at")},
+                metadata={"captured_at": metadata.get("captured_at"), **trail},
             )
         )
     if "gps" in metadata:
@@ -111,7 +139,7 @@ def normalize_image_metadata(metadata: dict[str, Any]) -> list[Entity]:
                 value=metadata["gps"],
                 source_file=source_file,
                 confidence=1.0,
-                metadata={"captured_at": metadata.get("captured_at")},
+                metadata={"captured_at": metadata.get("captured_at"), **trail},
             )
         )
     return entities

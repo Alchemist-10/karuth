@@ -13,12 +13,17 @@ from pydantic import BaseModel, Field
 
 ToolName = Literal[
     "ExtractionAgent",
+    "ObservationAgent",
     "CorrelationAgent",
     "TimelineAgent",
     "TriageAgent",
     "ReportAgent",
     "LegalActionAgent",
     "VisionAgent",
+    "HypothesisAgent",
+    "ContradictionHunter",
+    "SkepticReview",
+    "MvdRegistryLookup",
 ]
 
 RiskLevel = Literal["LOW", "MED", "CRITICAL"]
